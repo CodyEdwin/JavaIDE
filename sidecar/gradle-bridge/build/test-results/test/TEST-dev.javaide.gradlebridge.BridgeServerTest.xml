@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="dev.javaide.gradlebridge.BridgeServerTest" tests="1" skipped="0" failures="0" errors="0" timestamp="2026-10-24T05:58:22.936Z" hostname="reichvps" time="0.221">
+  <properties/>
+  <testcase name="dispatchesInitializeSyncCancelAndShutdown()" classname="dev.javaide.gradlebridge.BridgeServerTest" time="0.1"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

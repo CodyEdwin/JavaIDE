@@ -1,0 +1,24 @@
+[package]
+name = "ide-phase0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "phase0"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ide-gradle = { path = "../ide-gradle" }
+ide-jdtls = { path = "../ide-jdtls" }
+ide-opencode = { path = "../ide-opencode" }
+ide-platform = { path = "../ide-platform" }
+lsp-types = "0.97"
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

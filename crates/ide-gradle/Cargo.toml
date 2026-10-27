@@ -1,0 +1,18 @@
+[package]
+name = "ide-gradle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+ide-jsonrpc = { path = "../ide-jsonrpc" }
+ide-platform = { path = "../ide-platform" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

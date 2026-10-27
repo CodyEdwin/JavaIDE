@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>JavaIDE</title>
+    <script type="module" crossorigin src="/assets/index-BkwTbTtA.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-TyS-UIv8.css">
+  </head>
+  <body>
+    <div id="app">
+      <header id="titlebar">
+        <div class="brand"><span class="brand-mark">J</span> JavaIDE</div>
+        <button id="open-folder" class="toolbar-button">Open Folder</button>
+        <span id="workspace-path" class="workspace-path"></span>
+        <span id="busy" class="busy hidden">working…</span>
+      </header>
+
+      <div id="body">
+        <nav id="activity">
+          <button class="activity-button active" data-panel="files" title="Explorer">▤</button>
+          <button class="activity-button" data-panel="gradle" title="Gradle">G</button>
+          <button class="activity-button" data-panel="ai" title="OpenCode">AI</button>
+        </nav>
+
+        <aside id="sidebar">
+          <section id="panel-files" class="panel">
+            <div class="panel-header">
+              <span>Explorer</span>
+              <button id="refresh-files" class="icon-button" title="Refresh">⟳</button>
+            </div>
+            <div id="file-tree" class="file-tree"></div>
+          </section>
+
+          <section id="panel-gradle" class="panel hidden">
+            <div class="panel-header">
+              <span>Gradle</span>
+              <div class="panel-actions">
+                <button id="gradle-stop" class="text-button danger" title="Stop the running Gradle operation" disabled>Stop</button>
+                <button id="gradle-settings-toggle" class="icon-button" title="Gradle command-line settings">⚙</button>
+                <button id="gradle-sync" class="icon-button" title="Sync project">⟳</button>
+              </div>
+            </div>
+            <div id="gradle-settings" class="gradle-settings hidden">
+              <div class="gradle-settings-row">
+                <label for="gradle-log-level">Log level</label>
+                <select id="gradle-log-level">
+                  <option value="">Default</option>
+                  <option value="--info">Info (--info)</option>
+                  <option value="--debug">Debug (--debug)</option>
+                </select>
+              </div>
+              <div class="gradle-option-grid">
+                <label><input type="checkbox" id="gradle-opt-stacktrace" /> --stacktrace</label>
+                <label><input type="checkbox" id="gradle-opt-offline" /> --offline</label>
+                <label><input type="checkbox" id="gradle-opt-warnings" /> --warning-mode all</label>
+              </div>
+              <input id="gradle-extra-args" class="gradle-extra-args" type="text" spellcheck="false"
+                placeholder="Extra arguments (e.g. --console=plain -Pkey=value)" />
+              <div class="gradle-settings-hint">
+                Applied to sync, task runs, test discovery, and test runs.
+              </div>
+            </div>
+            <div id="gradle-summary" class="panel-note">Not synced.</div>
+            <div id="gradle-projects" class="gradle-projects"></div>
+            <div class="panel-header sub">
+              <span>Tests</span>
+              <button id="gradle-list-tests" class="text-button">Discover</button>
+            </div>
+            <div id="gradle-tests" class="gradle-tests"></div>
+            <div class="panel-header sub"><span>Output</span><button id="gradle-clear" class="text-button">Clear</button></div>
+            <pre id="gradle-log" class="log"></pre>
+          </section>
+
+          <section id="panel-ai" class="panel hidden">
+            <div class="panel-header">
+              <span>OpenCode</span>
+              <button id="ai-connect" class="text-button">Connect</button>
+            </div>
+            <div id="ai-status" class="panel-note">Not connected.</div>
+            <div class="ai-actions">
+              <button id="ai-new-session" class="text-button">New session</button>
+              <button id="ai-refresh" class="text-button">Refresh</button>
+            </div>
+            <div id="ai-sessions" class="ai-sessions"></div>
+            <div id="ai-messages" class="ai-messages"></div>
+            <div class="ai-composer">
+              <textarea id="ai-input" rows="3" placeholder="Ask OpenCode about this workspace…"></textarea>
+              <div class="ai-composer-actions">
+                <button id="ai-send" class="primary-button">Send</button>
+                <button id="ai-stop" class="text-button">Stop</button>
+              </div>
+            </div>
+          </section>
+        </aside>
+
+        <main id="main">
+          <div id="tabs" class="tabs"></div>
+          <div id="editor"></div>
+          <div id="welcome" class="welcome">
+            <h1>JavaIDE</h1>
+            <p>Rust core · jdtls · Gradle Tooling API · OpenCode V2</p>
+            <p class="hint">Open a file from the explorer to start editing.</p>
+          </div>
+        </main>
+      </div>
+
+      <footer id="statusbar">
+        <span id="status-text">Ready</span>
+        <span id="status-right"></span>
+      </footer>
+    </div>
+  </body>
+</html>

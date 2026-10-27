@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="dev.javaide.gradlebridge.TestRunScriptTest" tests="5" skipped="0" failures="0" errors="0" timestamp="2026-10-24T05:58:23.185Z" hostname="reichvps" time="0.017">
+  <properties/>
+  <testcase name="runAllScriptHasNoFiltersOrDebugOptions()" classname="dev.javaide.gradlebridge.TestRunScriptTest" time="0.006"/>
+  <testcase name="rejectsInvalidPorts()" classname="dev.javaide.gradlebridge.TestRunScriptTest" time="0.001"/>
+  <testcase name="rejectsNonLoopbackHosts()" classname="dev.javaide.gradlebridge.TestRunScriptTest" time="0.0"/>
+  <testcase name="rejectsInvalidTaskPaths()" classname="dev.javaide.gradlebridge.TestRunScriptTest" time="0.0"/>
+  <testcase name="writesDebugOptionsFiltersAndForcedExecution()" classname="dev.javaide.gradlebridge.TestRunScriptTest" time="0.005"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>
