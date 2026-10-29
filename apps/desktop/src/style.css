@@ -524,3 +524,48 @@ button:hover { background: var(--bg-raised); }
 }
 
 #statusbar.error { color: var(--danger); border-top-color: #5c2e2e; }
+
+.java-detail {
+  border-bottom: 1px solid var(--border);
+  word-break: break-word;
+}
+
+.problem-list {
+  overflow: auto;
+  flex: 1;
+  min-height: 80px;
+  padding: 4px 0;
+}
+
+.problem {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 10px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.problem:hover { background: var(--bg-raised); }
+.problem-location {
+  font-family: var(--font-mono);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.problem-message {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.problem.error .problem-message { color: #ff8f8f; }
+.problem.warning .problem-message { color: #e3b341; }
+.problem.info .problem-message,
+.problem.hint .problem-message { color: var(--muted); }
+
+.java-hover {
+  max-width: 520px;
+  max-height: 320px;
+  overflow: auto;
+  padding: 8px 10px;
+  font: 12px/1.45 var(--font-mono);
+  white-space: pre-wrap;
+}

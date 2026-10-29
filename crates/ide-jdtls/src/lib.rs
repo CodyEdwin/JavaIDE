@@ -43,6 +43,7 @@
 
 mod client;
 mod config;
+mod features;
 mod text;
 
 use std::path::PathBuf;
@@ -51,6 +52,10 @@ pub use client::{JdtlsClient, JdtlsEvent};
 pub use config::{
     JdtlsConfig, JdtlsInstallation, file_uri, is_launcher_jar, java_executable, parse_java_major,
     uri_to_path,
+};
+pub use features::{
+    CompletionCandidate, DocumentDiagnostics, HoverInfo, JavaDiagnostic, MAX_COMPLETION_CANDIDATES,
+    SourceLocation, SourcePosition, SourceRange, SourceTextEdit,
 };
 pub use text::{WorkspaceEditOutcome, apply_text_edits, apply_workspace_edit, position_to_offset};
 

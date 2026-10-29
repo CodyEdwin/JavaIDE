@@ -18,6 +18,7 @@
       <div id="body">
         <nav id="activity">
           <button class="activity-button active" data-panel="files" title="Explorer">▤</button>
+          <button class="activity-button" data-panel="java" title="Java language server">J</button>
           <button class="activity-button" data-panel="gradle" title="Gradle">G</button>
           <button class="activity-button" data-panel="ai" title="OpenCode">AI</button>
         </nav>
@@ -29,6 +30,26 @@
               <button id="refresh-files" class="icon-button" title="Refresh">⟳</button>
             </div>
             <div id="file-tree" class="file-tree"></div>
+          </section>
+
+          <section id="panel-java" class="panel hidden">
+            <div class="panel-header">
+              <span>Java</span>
+              <div class="panel-actions">
+                <button id="java-format" class="text-button" title="Format document (Shift+Alt+F)">Format</button>
+                <button id="java-organize" class="text-button" title="Organize imports (Shift+Alt+O)">Imports</button>
+                <button id="java-start" class="text-button">Start</button>
+              </div>
+            </div>
+            <div id="java-summary" class="panel-note">jdtls stopped</div>
+            <div id="java-detail" class="panel-note java-detail"></div>
+            <div class="panel-header sub"><span>Problems</span></div>
+            <div id="java-problems" class="problem-list"></div>
+            <div class="panel-header sub">
+              <span>Server log</span>
+              <button id="java-clear-log" class="text-button">Clear</button>
+            </div>
+            <pre id="java-log" class="log"></pre>
           </section>
 
           <section id="panel-gradle" class="panel hidden">

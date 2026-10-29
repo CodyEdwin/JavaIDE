@@ -12,9 +12,14 @@ use std::time::Duration;
 use ide_jsonrpc::{ErrorObject, Incoming, RequestId, RpcPeer};
 use ide_platform::{IoMode, ManagedChild, ProcessSpec};
 use lsp_types::{
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    ExecuteCommandParams, InitializeResult, PublishDiagnosticsParams, TextDocumentIdentifier,
-    TextDocumentItem, Uri, WorkDoneProgressParams, WorkspaceEdit,
+    CodeActionContext, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
+    CompletionParams, CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentFormattingParams,
+    ExecuteCommandParams, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverParams, InitializeResult, PartialResultParams, Position, PublishDiagnosticsParams, Range,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
+    WorkDoneProgressParams, WorkspaceEdit,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -24,6 +29,11 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::JdtlsError;
 use crate::config::{JdtlsConfig, file_uri};
+use crate::features::{
+    CompletionCandidate, DocumentDiagnostics, HoverInfo, SourceLocation, SourcePosition,
+    SourceTextEdit, completion_candidates, definition_locations, document_diagnostics, hover_info,
+    text_edits, workspace_text_edits,
+};
 use crate::text::apply_workspace_edit;
 
 const EVENT_CAPACITY: usize = 1024;
@@ -80,6 +90,21 @@ pub enum JdtlsEvent {
         /// Exit status, if it could be collected.
         status: Option<ExitStatus>,
     },
+}
+
+impl JdtlsEvent {
+    /// Returns the protocol-neutral diagnostic view for this event.
+    ///
+    /// Returns `None` for every other event, and for publications that use a
+    /// non-`file:` URI (for example a jdtls `jdt://` virtual document), which
+    /// the IDE cannot map to an editable document.
+    #[must_use]
+    pub fn diagnostics(&self) -> Option<DocumentDiagnostics> {
+        match self {
+            Self::Diagnostics(params) => document_diagnostics(params),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for JdtlsEvent {
@@ -462,6 +487,180 @@ impl JdtlsClient {
         Ok(())
     }
 
+    /// Sends a full-document `textDocument/didChange` notification.
+    ///
+    /// The change carries no range, which LSP defines as a complete replacement
+    /// of the document regardless of the server's synchronization kind. Keeping
+    /// the IDE's buffer authoritative is simpler and less error-prone than
+    /// maintaining a parallel incremental edit history for the server.
+    ///
+    /// `version` must increase monotonically for `path`. jdtls uses it to keep
+    /// diagnostics and edits attached to the text they describe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is not absolute or the notification cannot
+    /// be written.
+    pub async fn change_document(
+        &self,
+        path: &std::path::Path,
+        text: &str,
+        version: i32,
+    ) -> Result<Uri, JdtlsError> {
+        let uri = file_uri(path)?;
+        let params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: uri.clone(),
+                version,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: text.to_owned(),
+            }],
+        };
+        self.peer
+            .notify(
+                "textDocument/didChange",
+                Some(serde_json::to_value(params)?),
+            )
+            .await?;
+        Ok(uri)
+    }
+
+    /// Notifies jdtls that the document at `path` was saved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is not absolute or the notification cannot
+    /// be written.
+    pub async fn save_document_at(&self, path: &std::path::Path) -> Result<(), JdtlsError> {
+        let uri = file_uri(path)?;
+        self.save_document(&uri).await
+    }
+
+    /// Notifies jdtls that the document at `path` was closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is not absolute or the notification cannot
+    /// be written.
+    pub async fn close_document_at(&self, path: &std::path::Path) -> Result<(), JdtlsError> {
+        let uri = file_uri(path)?;
+        self.close_document(&uri).await
+    }
+
+    /// Requests hover information at `position`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JdtlsError::Timeout`] if no response arrives within `limit`, or
+    /// [`JdtlsError::Protocol`] if the response does not match the LSP schema.
+    pub async fn hover(
+        &self,
+        path: &std::path::Path,
+        position: SourcePosition,
+        limit: Duration,
+    ) -> Result<Option<HoverInfo>, JdtlsError> {
+        let params = HoverParams {
+            text_document_position_params: text_document_position(path, position)?,
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        };
+        let response = self
+            .peer
+            .request_with_timeout(
+                "textDocument/hover",
+                Some(serde_json::to_value(params)?),
+                limit,
+            )
+            .await?;
+        let hover: Option<Hover> = serde_json::from_value(response)
+            .map_err(|error| JdtlsError::Protocol(format!("invalid hover response: {error}")))?;
+        Ok(hover.map(hover_info))
+    }
+
+    /// Requests completion candidates at `position`.
+    ///
+    /// The result is bounded by
+    /// [`crate::MAX_COMPLETION_CANDIDATES`]; an empty vector means jdtls had no
+    /// suggestions for this position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JdtlsError::Timeout`] if no response arrives within `limit`, or
+    /// [`JdtlsError::Protocol`] if the response does not match the LSP schema.
+    pub async fn completion(
+        &self,
+        path: &std::path::Path,
+        position: SourcePosition,
+        limit: Duration,
+    ) -> Result<Vec<CompletionCandidate>, JdtlsError> {
+        let params = CompletionParams {
+            text_document_position: text_document_position(path, position)?,
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+            partial_result_params: PartialResultParams {
+                partial_result_token: None,
+            },
+            context: None,
+        };
+        let response = self
+            .peer
+            .request_with_timeout(
+                "textDocument/completion",
+                Some(serde_json::to_value(params)?),
+                limit,
+            )
+            .await?;
+        let completion: Option<CompletionResponse> =
+            serde_json::from_value(response).map_err(|error| {
+                JdtlsError::Protocol(format!("invalid completion response: {error}"))
+            })?;
+        Ok(completion.map(completion_candidates).unwrap_or_default())
+    }
+
+    /// Resolves the definitions at `position`.
+    ///
+    /// Locations whose URI is not a `file:` URI, such as jdtls `jdt://`
+    /// class-file documents, are dropped; they have no source in the workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JdtlsError::Timeout`] if no response arrives within `limit`, or
+    /// [`JdtlsError::Protocol`] if the response does not match the LSP schema.
+    pub async fn definition(
+        &self,
+        path: &std::path::Path,
+        position: SourcePosition,
+        limit: Duration,
+    ) -> Result<Vec<SourceLocation>, JdtlsError> {
+        let params = GotoDefinitionParams {
+            text_document_position_params: text_document_position(path, position)?,
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+            partial_result_params: PartialResultParams {
+                partial_result_token: None,
+            },
+        };
+        let response = self
+            .peer
+            .request_with_timeout(
+                "textDocument/definition",
+                Some(serde_json::to_value(params)?),
+                limit,
+            )
+            .await?;
+        let definition: Option<GotoDefinitionResponse> =
+            serde_json::from_value(response).map_err(|error| {
+                JdtlsError::Protocol(format!("invalid definition response: {error}"))
+            })?;
+        Ok(definition.map(definition_locations).unwrap_or_default())
+    }
+
     /// Waits for the next diagnostics publication for `uri`.
     ///
     /// Returns the cached publication if one already exists, so this is safe to
@@ -539,6 +738,119 @@ impl JdtlsClient {
             .request_with_timeout("workspace/executeCommand", Some(value), limit)
             .await?;
         Ok(response)
+    }
+
+    /// Requests whole-document formatting.
+    ///
+    /// The returned edits target the caller's buffer: applying them to disk
+    /// would discard unsaved changes. `tab_size` and `insert_spaces` come from
+    /// the editor settings, mirroring the LSP formatting options.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JdtlsError::Timeout`] if no response arrives within `limit`, or
+    /// [`JdtlsError::Protocol`] if the response does not match the LSP schema.
+    pub async fn format_document(
+        &self,
+        path: &std::path::Path,
+        tab_size: u32,
+        insert_spaces: bool,
+        limit: Duration,
+    ) -> Result<Vec<SourceTextEdit>, JdtlsError> {
+        let params = DocumentFormattingParams {
+            text_document: TextDocumentIdentifier {
+                uri: file_uri(path)?,
+            },
+            options: FormattingOptions {
+                tab_size,
+                insert_spaces,
+                ..FormattingOptions::default()
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        };
+        let response = self
+            .peer
+            .request_with_timeout(
+                "textDocument/formatting",
+                Some(serde_json::to_value(params)?),
+                limit,
+            )
+            .await?;
+        let edits: Option<Vec<TextEdit>> = serde_json::from_value(response).map_err(|error| {
+            JdtlsError::Protocol(format!("invalid formatting response: {error}"))
+        })?;
+        Ok(edits.map(text_edits).unwrap_or_default())
+    }
+
+    /// Requests `source.organizeImports` and extracts the edits for `path`.
+    ///
+    /// Returns an empty vector when jdtls reports nothing to change or supplies
+    /// an action without an edit. Edits for other files are ignored because the
+    /// caller only owns the active buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JdtlsError::Timeout`] if no response arrives within `limit`, or
+    /// [`JdtlsError::Protocol`] if the response does not match the LSP schema.
+    pub async fn organize_imports(
+        &self,
+        path: &std::path::Path,
+        limit: Duration,
+    ) -> Result<Vec<SourceTextEdit>, JdtlsError> {
+        let uri = file_uri(path)?;
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            // jdtls organizes the whole file regardless of the requested range;
+            // a zero-width range keeps the request cheap and deterministic.
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 0,
+                },
+            },
+            context: CodeActionContext {
+                diagnostics: Vec::new(),
+                only: Some(vec![CodeActionKind::SOURCE_ORGANIZE_IMPORTS]),
+                trigger_kind: None,
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+            partial_result_params: PartialResultParams {
+                partial_result_token: None,
+            },
+        };
+        let response = self
+            .peer
+            .request_with_timeout(
+                "textDocument/codeAction",
+                Some(serde_json::to_value(params)?),
+                limit,
+            )
+            .await?;
+        let actions: Option<CodeActionResponse> =
+            serde_json::from_value(response).map_err(|error| {
+                JdtlsError::Protocol(format!("invalid code action response: {error}"))
+            })?;
+        for action in actions.unwrap_or_default() {
+            let CodeActionOrCommand::CodeAction(action) = action else {
+                continue;
+            };
+            let Some(edit) = action.edit else {
+                continue;
+            };
+            let edits = workspace_text_edits(&edit, &uri);
+            if !edits.is_empty() {
+                return Ok(edits);
+            }
+        }
+        Ok(Vec::new())
     }
 
     /// Returns whether the transport is closed.
@@ -635,6 +947,21 @@ async fn probe_java_major(java: &std::path::Path) -> Result<u32, JdtlsError> {
                 .trim()
                 .to_owned(),
         )
+    })
+}
+
+fn text_document_position(
+    path: &std::path::Path,
+    position: SourcePosition,
+) -> Result<TextDocumentPositionParams, JdtlsError> {
+    Ok(TextDocumentPositionParams {
+        text_document: TextDocumentIdentifier {
+            uri: file_uri(path)?,
+        },
+        position: Position {
+            line: position.line,
+            character: position.character,
+        },
     })
 }
 

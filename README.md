@@ -7,10 +7,12 @@ The Java intelligence is provided by the
 [Eclipse JDT Language Server (jdtls)](https://github.com/eclipse-jdtls/eclipse.jdt.ls).
 The IDE does not reimplement javac, a Java parser, or a Gradle build engine.
 
-> **Status: Phase 0 adapters validated; desktop shell in progress.** The
-> repository contains the design set, the Rust/Java integration crates, and a
-> Tauri desktop shell with editor, Gradle, and OpenCode panels. jdtls
-> diagnostics are not wired into the shell yet.
+> **Status: Phase 1 in progress.** The repository contains the design set, the
+> Rust/Java integration crates, and a Tauri desktop shell with editor, Gradle,
+> Java, and OpenCode panels. jdtls diagnostics, completion, hover,
+> go-to-definition, formatting, and organize imports are wired into the shell;
+> the remaining Phase 1 checklist is
+> tracked in [docs/PHASE1_STATUS.md](docs/PHASE1_STATUS.md).
 
 ## Run the desktop shell
 
@@ -50,6 +52,7 @@ the local V2 service.
 | --- | --- |
 | [docs/PLAN.md](docs/PLAN.md) | Product scope, decisions, risks, milestones |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Phases, deliverables, exit criteria, timeline |
+| [docs/PHASE1_STATUS.md](docs/PHASE1_STATUS.md) | Phase 1 checklist: done, remaining, exit-criteria status |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate map, dependency rules, ports, concurrency |
 | [docs/JDTLS.md](docs/JDTLS.md) | jdtls provisioning, lifecycle, settings, protocol mapping |
 | [docs/GRADLE.md](docs/GRADLE.md) | Gradle sidecar, sync, tasks, tests, compatibility |

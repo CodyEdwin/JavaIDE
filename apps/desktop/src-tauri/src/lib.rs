@@ -4,6 +4,7 @@
 //! owns presentation only; files, Gradle, and OpenCode all go through these
 //! commands.
 
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -15,11 +16,15 @@ use ide_gradle::{
     BuildSnapshot, GradleClient, GradleOptions, RunTaskRequest, RunTaskResult, RunTestsRequest,
     RunTestsResult, TestListing,
 };
+use ide_jdtls::{
+    CompletionCandidate, HoverInfo, JdtlsClient, JdtlsConfig, JdtlsEvent, JdtlsInstallation,
+    SourceLocation, SourcePosition, SourceTextEdit,
+};
 use ide_opencode::{CreateSession, DiscoveredService, OpenCodeClient, PromptInput};
 use serde::Serialize;
 use serde_json::Value;
-use tauri::{AppHandle, Emitter, State};
-use tokio::sync::Mutex;
+use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::{Mutex, broadcast};
 
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TREE_ENTRIES: usize = 4000;
@@ -31,6 +36,62 @@ struct AppState {
     gradle_active: Mutex<Option<GradleOperation>>,
     gradle_next_id: AtomicU64,
     opencode: Mutex<Option<Arc<OpenCodeClient>>>,
+    java: Mutex<JavaSession>,
+}
+
+/// Lifecycle state of the Java language server for the open workspace.
+///
+/// The client is reachable through an [`Arc`] so concurrent hover/completion
+/// requests never queue behind a running request. Shutdown takes the `Arc` out
+/// of this state and unwraps it; if a request is still in flight the process is
+/// stopped by [`JdtlsClient`]'s `Drop` instead of hanging the UI.
+struct JavaSession {
+    client: Option<Arc<JdtlsClient>>,
+    state: String,
+    message: String,
+    pid: Option<u32>,
+    jdtls_root: Option<PathBuf>,
+    java_home: Option<PathBuf>,
+}
+
+impl JavaSession {
+    fn stopped() -> Self {
+        Self {
+            client: None,
+            state: "stopped".to_owned(),
+            message: "Java language server is not running.".to_owned(),
+            pid: None,
+            jdtls_root: None,
+            java_home: None,
+        }
+    }
+
+    fn status(&self) -> JavaStatus {
+        JavaStatus {
+            state: self.state.clone(),
+            message: self.message.clone(),
+            pid: self.pid,
+            jdtls_root: self.jdtls_root.as_deref().map(path_text),
+            java_home: self.java_home.as_deref().map(path_text),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JavaStatus {
+    state: String,
+    message: String,
+    pid: Option<u32>,
+    jdtls_root: Option<String>,
+    java_home: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JavaEvent {
+    name: String,
+    data: Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,6 +110,7 @@ impl AppState {
             gradle_active: Mutex::new(None),
             gradle_next_id: AtomicU64::new(1),
             opencode: Mutex::new(None),
+            java: Mutex::new(JavaSession::stopped()),
         }
     }
 
@@ -136,7 +198,11 @@ fn default_workspace() -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn open_workspace(state: State<'_, AppState>, path: String) -> Result<WorkspaceView, String> {
+async fn open_workspace(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<WorkspaceView, String> {
     let root = PathBuf::from(path)
         .canonicalize()
         .map_err(|error| format!("cannot open workspace: {error}"))?;
@@ -149,6 +215,10 @@ async fn open_workspace(state: State<'_, AppState>, path: String) -> Result<Work
         .workspace
         .write()
         .map_err(|_| "workspace lock poisoned")? = root.clone();
+    // The language server indexes one workspace. Stop it before the explorer
+    // and the Gradle bridge describe the new project, otherwise diagnostics
+    // from the previous root keep arriving for paths that are no longer open.
+    stop_java(&app, &state).await;
     // Stop any running operation and the previous project's bridge before the
     // next sync starts. A run that is already unwinding only clears the active
     // slot when its own request id still matches, so it cannot clobber a newer
@@ -353,6 +423,660 @@ async fn gradle_cancel(state: State<'_, AppState>) -> Result<GradleCancelResult,
 #[tauri::command]
 async fn gradle_active(state: State<'_, AppState>) -> Result<Option<GradleOperation>, String> {
     Ok(state.gradle_active.lock().await.clone())
+}
+
+/* ---------------- java language server ---------------- */
+
+/// Returns the Java language-server state without starting it.
+#[tauri::command]
+async fn java_status(state: State<'_, AppState>) -> Result<JavaStatus, String> {
+    Ok(java_status_snapshot(&state).await)
+}
+
+/// Starts jdtls for the open workspace; safe to call repeatedly.
+#[tauri::command]
+async fn java_start(app: AppHandle, state: State<'_, AppState>) -> Result<JavaStatus, String> {
+    Ok(start_java(&app, &state).await)
+}
+
+/// Stops and restarts the Java language server.
+#[tauri::command]
+async fn java_restart(app: AppHandle, state: State<'_, AppState>) -> Result<JavaStatus, String> {
+    stop_java(&app, &state).await;
+    Ok(start_java(&app, &state).await)
+}
+
+/// Opens a document in jdtls, starting the server if needed.
+#[tauri::command]
+async fn java_open_document(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    text: String,
+    version: i32,
+) -> Result<JavaStatus, String> {
+    let root = workspace_root(&state)?;
+    let file = resolve_workspace_file(&root, &path)?;
+    let client = ensure_java(&app, &state).await?;
+    client
+        .open_document(&file, &text, version)
+        .await
+        .map_err(|error| format!("cannot open {} in jdtls: {error}", file.display()))?;
+    Ok(java_status_snapshot(&state).await)
+}
+
+/// Sends full document contents to jdtls. Ignored when the server is stopped.
+#[tauri::command]
+async fn java_change_document(
+    state: State<'_, AppState>,
+    path: String,
+    text: String,
+    version: i32,
+) -> Result<(), String> {
+    let Some(client) = java_client_if_ready(&state).await else {
+        return Ok(());
+    };
+    let root = workspace_root(&state)?;
+    let file = resolve_workspace_file(&root, &path)?;
+    client
+        .change_document(&file, &text, version)
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("cannot update {} in jdtls: {error}", file.display()))
+}
+
+/// Notifies jdtls that a document was saved. Ignored when the server is stopped.
+#[tauri::command]
+async fn java_save_document(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let Some(client) = java_client_if_ready(&state).await else {
+        return Ok(());
+    };
+    let root = workspace_root(&state)?;
+    let file = resolve_workspace_file(&root, &path)?;
+    client
+        .save_document_at(&file)
+        .await
+        .map_err(|error| format!("cannot mark {} saved in jdtls: {error}", file.display()))
+}
+
+/// Notifies jdtls that a document was closed. Ignored when the server is stopped.
+#[tauri::command]
+async fn java_close_document(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let Some(client) = java_client_if_ready(&state).await else {
+        return Ok(());
+    };
+    let root = workspace_root(&state)?;
+    let file = resolve_workspace_file(&root, &path)?;
+    client
+        .close_document_at(&file)
+        .await
+        .map_err(|error| format!("cannot close {} in jdtls: {error}", file.display()))
+}
+
+/// Requests hover information. Returns `None` when there is nothing to show.
+#[tauri::command]
+async fn java_hover(
+    state: State<'_, AppState>,
+    path: String,
+    line: u32,
+    character: u32,
+) -> Result<Option<HoverInfo>, String> {
+    let root = workspace_root(&state)?;
+    let file = resolve_workspace_file(&root, &path)?;
+    let client = java_client(&state).await?;
+    client
+        .hover(
+            &file,
+            SourcePosition::new(line, character),
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|error| format!("Hover failed: {error}"))
+}
+
+/// Requests completion candidates for a position.
+#[tauri::command]
+async fn java_completion(
+    state: State<'_, AppState>,
+    path: String,
+    line: u32,
+    character: u32,
+) -> Result<Vec<CompletionCandidate>, String> {
+    let root = workspace_root(&state)?;
+    let file = resolve_workspace_file(&root, &path)?;
+    let client = java_client(&state).await?;
+    client
+        .completion(
+            &file,
+            SourcePosition::new(line, character),
+            Duration::from_secs(15),
+        )
+        .await
+        .map_err(|error| format!("Completion failed: {error}"))
+}
+
+/// Resolves definitions for the symbol at a position.
+#[tauri::command]
+async fn java_definition(
+    state: State<'_, AppState>,
+    path: String,
+    line: u32,
+    character: u32,
+) -> Result<Vec<SourceLocation>, String> {
+    let root = workspace_root(&state)?;
+    let file = resolve_workspace_file(&root, &path)?;
+    let client = java_client(&state).await?;
+    client
+        .definition(
+            &file,
+            SourcePosition::new(line, character),
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|error| format!("Go to definition failed: {error}"))
+}
+
+/// Formats the document in the active buffer.
+///
+/// Edits are returned to the caller and applied to the buffer, so formatting
+/// never rewrites the file or discards unsaved changes.
+#[tauri::command]
+async fn java_format_document(
+    state: State<'_, AppState>,
+    path: String,
+    tab_size: Option<u32>,
+    insert_spaces: Option<bool>,
+) -> Result<Vec<SourceTextEdit>, String> {
+    let root = workspace_root(&state)?;
+    let file = resolve_workspace_file(&root, &path)?;
+    let client = java_client(&state).await?;
+    client
+        .format_document(
+            &file,
+            tab_size.unwrap_or(4).clamp(1, 16),
+            insert_spaces.unwrap_or(true),
+            Duration::from_secs(15),
+        )
+        .await
+        .map_err(|error| format!("Formatting failed: {error}"))
+}
+
+/// Returns the `source.organizeImports` edits for the active buffer.
+#[tauri::command]
+async fn java_organize_imports(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Vec<SourceTextEdit>, String> {
+    let root = workspace_root(&state)?;
+    let file = resolve_workspace_file(&root, &path)?;
+    let client = java_client(&state).await?;
+    client
+        .organize_imports(&file, Duration::from_secs(15))
+        .await
+        .map_err(|error| format!("Organize imports failed: {error}"))
+}
+
+fn path_text(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn workspace_root(state: &AppState) -> Result<PathBuf, String> {
+    state
+        .workspace
+        .read()
+        .map(|workspace| workspace.clone())
+        .map_err(|_| "workspace lock poisoned".to_owned())
+}
+
+fn resolve_workspace_file(root: &Path, path: &str) -> Result<PathBuf, String> {
+    let canonical = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|error| format!("cannot open file: {error}"))?;
+    if !canonical.starts_with(root) {
+        return Err("file is outside the workspace".to_owned());
+    }
+    Ok(canonical)
+}
+
+async fn java_client(state: &AppState) -> Result<Arc<JdtlsClient>, String> {
+    let session = state.java.lock().await;
+    session
+        .client
+        .clone()
+        .ok_or_else(|| session.message.clone())
+}
+
+async fn java_client_if_ready(state: &AppState) -> Option<Arc<JdtlsClient>> {
+    state.java.lock().await.client.clone()
+}
+
+/// Returns the live session status, or a discovery summary when stopped.
+async fn java_status_snapshot(state: &AppState) -> JavaStatus {
+    let live = {
+        let session = state.java.lock().await;
+        if session.client.is_none() && session.state == "stopped" {
+            None
+        } else {
+            Some(session.status())
+        }
+    };
+    live.unwrap_or_else(discovery_status)
+}
+
+/// Describes whether jdtls could be started, without spawning a JVM.
+fn discovery_status() -> JavaStatus {
+    let root = discover_jdtls_root();
+    let java_home = find_jdtls_java_home();
+    let (state, message) = match (&root, &java_home) {
+        (Some(root), Some(java)) => (
+            "stopped",
+            format!("jdtls at {} · JDK {}", root.display(), java.display()),
+        ),
+        (Some(_), None) => (
+            "unavailable",
+            "No JDK 21+ was found for jdtls. Set JAVAIDE_JDTLS_JAVA_HOME or JAVA_HOME.".to_owned(),
+        ),
+        (None, _) => (
+            "unavailable",
+            "jdtls was not found. Set JAVAIDE_JDTLS_HOME to an extracted jdtls distribution."
+                .to_owned(),
+        ),
+    };
+    JavaStatus {
+        state: state.to_owned(),
+        message,
+        pid: None,
+        jdtls_root: root.as_deref().map(path_text),
+        java_home: java_home.as_deref().map(path_text),
+    }
+}
+
+/// Starts jdtls unless a start is already in flight or a session is live.
+///
+/// A failed start is reported through the returned status instead of an error:
+/// a machine without jdtls is a supported configuration, and the rest of the
+/// IDE keeps working.
+async fn start_java(app: &AppHandle, state: &AppState) -> JavaStatus {
+    {
+        let mut session = state.java.lock().await;
+        if session.client.is_some() || session.state == "starting" {
+            return session.status();
+        }
+        // Claim the start while the lock is held so two concurrent document
+        // opens cannot spawn two servers against the same data directory.
+        session.state = "starting".to_owned();
+        session.message = "Locating jdtls…".to_owned();
+    }
+    let Ok(root) = workspace_root(state) else {
+        return discovery_status();
+    };
+    let Some(installation_root) = discover_jdtls_root() else {
+        return set_java_session(
+            app,
+            state,
+            None,
+            "unavailable",
+            "jdtls was not found. Set JAVAIDE_JDTLS_HOME to an extracted jdtls distribution."
+                .to_owned(),
+            None,
+            None,
+        )
+        .await;
+    };
+    let Some(java_home) = find_jdtls_java_home() else {
+        return set_java_session(
+            app,
+            state,
+            None,
+            "unavailable",
+            "No JDK 21+ was found for jdtls. Set JAVAIDE_JDTLS_JAVA_HOME or JAVA_HOME.".to_owned(),
+            Some(installation_root),
+            None,
+        )
+        .await;
+    };
+    let installation = match JdtlsInstallation::discover(&installation_root) {
+        Ok(installation) => installation,
+        Err(error) => {
+            return set_java_session(
+                app,
+                state,
+                None,
+                "unavailable",
+                format!("Invalid jdtls installation: {error}"),
+                Some(installation_root),
+                Some(java_home),
+            )
+            .await;
+        }
+    };
+    let config = JdtlsConfig::new(&java_home, installation, workspace_data_dir(&root), &root);
+    set_java_session(
+        app,
+        state,
+        None,
+        "starting",
+        format!("Starting jdtls for {}…", root.display()),
+        Some(installation_root.clone()),
+        Some(java_home.clone()),
+    )
+    .await;
+
+    let client = match JdtlsClient::start(config).await {
+        Ok(client) => Arc::new(client),
+        Err(error) => {
+            return java_failed(
+                app,
+                state,
+                format!("jdtls failed to start: {error}"),
+                installation_root,
+                java_home,
+            )
+            .await;
+        }
+    };
+    // Subscribe before the handshake so status and log events during indexing
+    // reach the UI instead of being lost.
+    spawn_java_events(app.clone(), client.subscribe());
+    if let Err(error) = client.initialize().await {
+        return java_failed(
+            app,
+            state,
+            format!("jdtls initialize failed: {error}"),
+            installation_root,
+            java_home,
+        )
+        .await;
+    }
+    if let Err(error) = client.initialized().await {
+        return java_failed(
+            app,
+            state,
+            format!("jdtls setup failed: {error}"),
+            installation_root,
+            java_home,
+        )
+        .await;
+    }
+    if let Err(error) = client
+        .wait_for_service_ready(Duration::from_secs(120))
+        .await
+    {
+        return java_failed(
+            app,
+            state,
+            format!("jdtls did not become ready: {error}"),
+            installation_root,
+            java_home,
+        )
+        .await;
+    }
+    let message = client.pid().map_or_else(
+        || "jdtls ready".to_owned(),
+        |pid| format!("jdtls ready · pid {pid}"),
+    );
+    set_java_session(
+        app,
+        state,
+        Some(client),
+        "ready",
+        message,
+        Some(installation_root),
+        Some(java_home),
+    )
+    .await
+}
+
+async fn java_failed(
+    app: &AppHandle,
+    state: &AppState,
+    message: String,
+    jdtls_root: PathBuf,
+    java_home: PathBuf,
+) -> JavaStatus {
+    set_java_session(
+        app,
+        state,
+        None,
+        "failed",
+        message,
+        Some(jdtls_root),
+        Some(java_home),
+    )
+    .await
+}
+
+async fn ensure_java(app: &AppHandle, state: &AppState) -> Result<Arc<JdtlsClient>, String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        if let Some(client) = state.java.lock().await.client.clone() {
+            return Ok(client);
+        }
+        let status = start_java(app, state).await;
+        if status.state == "starting" {
+            if tokio::time::Instant::now() > deadline {
+                return Err("Timed out waiting for jdtls to start".to_owned());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+        if let Some(client) = state.java.lock().await.client.clone() {
+            return Ok(client);
+        }
+        return Err(status.message);
+    }
+}
+
+async fn set_java_session(
+    app: &AppHandle,
+    state: &AppState,
+    client: Option<Arc<JdtlsClient>>,
+    session_state: &str,
+    message: String,
+    jdtls_root: Option<PathBuf>,
+    java_home: Option<PathBuf>,
+) -> JavaStatus {
+    let pid = client.as_ref().and_then(|client| client.pid());
+    let status = {
+        let mut session = state.java.lock().await;
+        session.client = client;
+        session.state = session_state.to_owned();
+        session.message = message;
+        session.pid = pid;
+        session.jdtls_root = jdtls_root;
+        session.java_home = java_home;
+        session.status()
+    };
+    emit_java_status(app, &status);
+    status
+}
+
+/// Stops jdtls for the current workspace and records the stopped state.
+///
+/// The `Arc` is unwrapped so the protocol-level shutdown can run; when a
+/// request still holds a handle, dropping the last handle kills the process,
+/// which still leaves no orphan behind.
+async fn stop_java(app: &AppHandle, state: &AppState) {
+    let client = {
+        let mut session = state.java.lock().await;
+        session.state = "stopping".to_owned();
+        session.client.take()
+    };
+    if let Some(client) = client
+        && let Ok(mut owned) = Arc::try_unwrap(client)
+    {
+        let _ = owned.shutdown(Duration::from_secs(10)).await;
+    }
+    set_java_session(
+        app,
+        state,
+        None,
+        "stopped",
+        "Java language server is stopped.".to_owned(),
+        None,
+        None,
+    )
+    .await;
+}
+
+fn emit_java_status(app: &AppHandle, status: &JavaStatus) {
+    let data = serde_json::to_value(status).unwrap_or(Value::Null);
+    let _ = app.emit(
+        "java://event",
+        JavaEvent {
+            name: "status".to_owned(),
+            data,
+        },
+    );
+}
+
+fn spawn_java_events(app: AppHandle, mut events: broadcast::Receiver<JdtlsEvent>) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    let diagnostics = event.diagnostics();
+                    let terminal = matches!(
+                        &event,
+                        JdtlsEvent::Closed { .. } | JdtlsEvent::Exited { .. }
+                    );
+                    if let Some(diagnostics) = diagnostics {
+                        let data = serde_json::to_value(diagnostics).unwrap_or(Value::Null);
+                        let _ = app.emit("java://diagnostics", data);
+                    } else if let Some((name, data)) = java_event_payload(&event) {
+                        let _ = app.emit("java://event", JavaEvent { name, data });
+                    }
+                    if terminal {
+                        mark_java_dead(&app).await;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+fn java_event_payload(event: &JdtlsEvent) -> Option<(String, Value)> {
+    match event {
+        JdtlsEvent::Status { kind, message } => Some((
+            "status-message".to_owned(),
+            serde_json::json!({ "kind": kind, "message": message }),
+        )),
+        JdtlsEvent::LogMessage { level, message } | JdtlsEvent::ShowMessage { level, message } => {
+            Some((
+                "log".to_owned(),
+                serde_json::json!({ "level": level, "message": message }),
+            ))
+        }
+        JdtlsEvent::Progress { token, value } => Some((
+            "progress".to_owned(),
+            serde_json::json!({ "token": token, "value": value }),
+        )),
+        JdtlsEvent::Closed { reason } => {
+            Some(("closed".to_owned(), serde_json::json!({ "reason": reason })))
+        }
+        JdtlsEvent::Exited { status } => Some((
+            "closed".to_owned(),
+            serde_json::json!({ "reason": format!("process exited: {status:?}") }),
+        )),
+        JdtlsEvent::Diagnostics(_) | JdtlsEvent::Notification { .. } => None,
+    }
+}
+
+/// Marks the session failed after the process disappears without a stop request.
+async fn mark_java_dead(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let status = {
+        let mut session = state.java.lock().await;
+        if session.client.is_none() {
+            return;
+        }
+        session.client = None;
+        session.pid = None;
+        session.state = "failed".to_owned();
+        session.message = "jdtls stopped unexpectedly. Restart it from the Java panel.".to_owned();
+        session.status()
+    };
+    emit_java_status(app, &status);
+}
+
+fn discover_jdtls_root() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("JAVAIDE_JDTLS_HOME") {
+        let path = PathBuf::from(path);
+        if JdtlsInstallation::discover(path.clone()).is_ok() {
+            return Some(path.canonicalize().unwrap_or(path));
+        }
+    }
+    let mut candidates = vec![
+        repo_root().join("sidecar").join("jdtls"),
+        PathBuf::from("/opt/jdtls"),
+        PathBuf::from("/usr/local/lib/jdtls"),
+    ];
+    let installed = app_data_dir().join("jdtls");
+    candidates.extend(version_directories(&installed));
+    candidates.push(installed);
+    candidates
+        .into_iter()
+        .find(|candidate| JdtlsInstallation::discover(candidate.clone()).is_ok())
+        .map(|candidate| candidate.canonicalize().unwrap_or(candidate))
+}
+
+fn find_jdtls_java_home() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for variable in ["JAVAIDE_JDTLS_JAVA_HOME", "JAVA_HOME"] {
+        if let Some(home) = std::env::var_os(variable) {
+            candidates.push(PathBuf::from(home));
+        }
+    }
+    candidates.push(PathBuf::from("/usr/lib/jvm/temurin-21"));
+    candidates.push(PathBuf::from("/usr/lib/jvm/temurin-25"));
+    candidates.push(PathBuf::from("/opt/java/temurin-21"));
+    candidates.extend(version_directories(&app_data_dir().join("runtimes")));
+    candidates
+        .into_iter()
+        .find(|home| {
+            home.join("bin").join("java").is_file()
+                && java_major(home).is_some_and(|major| major >= 21)
+        })
+        .map(|home| home.canonicalize().unwrap_or(home))
+}
+
+fn version_directories(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut directories = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    // Newest version last in lexicographic order becomes first.
+    directories.sort();
+    directories.reverse();
+    directories
+}
+
+/// Per-workspace jdtls state. jdtls requires a writable `-data` directory that
+/// is unique per workspace and never inside the project.
+fn workspace_data_dir(root: &Path) -> PathBuf {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.to_string_lossy().hash(&mut hasher);
+    app_data_dir()
+        .join("jdtls-data")
+        .join(format!("{:016x}", hasher.finish()))
+}
+
+fn app_data_dir() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME")
+        && !xdg.is_empty()
+    {
+        return PathBuf::from(xdg).join("javaide");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".local/share/javaide");
+    }
+    std::env::temp_dir().join("javaide")
 }
 
 #[tauri::command]
@@ -684,6 +1408,44 @@ fn is_skipped(name: &str) -> bool {
     )
 }
 
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .manage(AppState::new())
+        .invoke_handler(tauri::generate_handler![
+            default_workspace,
+            open_workspace,
+            read_file,
+            write_file,
+            gradle_sync,
+            gradle_run_task,
+            gradle_list_tests,
+            gradle_run_tests,
+            gradle_cancel,
+            gradle_active,
+            java_status,
+            java_start,
+            java_restart,
+            java_open_document,
+            java_change_document,
+            java_save_document,
+            java_close_document,
+            java_hover,
+            java_completion,
+            java_definition,
+            java_format_document,
+            java_organize_imports,
+            opencode_connect,
+            opencode_sessions,
+            opencode_create_session,
+            opencode_context,
+            opencode_prompt,
+            opencode_interrupt,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running JavaIDE");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,30 +1482,4 @@ mod tests {
         assert_eq!(value["requestId"], "task-7");
         assert_eq!(value["kind"], "task");
     }
-}
-
-pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
-        .manage(AppState::new())
-        .invoke_handler(tauri::generate_handler![
-            default_workspace,
-            open_workspace,
-            read_file,
-            write_file,
-            gradle_sync,
-            gradle_run_task,
-            gradle_list_tests,
-            gradle_run_tests,
-            gradle_cancel,
-            gradle_active,
-            opencode_connect,
-            opencode_sessions,
-            opencode_create_session,
-            opencode_context,
-            opencode_prompt,
-            opencode_interrupt,
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while running JavaIDE");
 }

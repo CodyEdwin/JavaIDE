@@ -1829,6 +1829,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ide-gradle",
+ "ide-jdtls",
  "ide-opencode",
  "serde",
  "serde_json",

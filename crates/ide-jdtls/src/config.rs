@@ -4,11 +4,12 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use lsp_types::{
-    ClientCapabilities, ClientInfo, FailureHandlingKind, GeneralClientCapabilities,
-    InitializeParams, PositionEncodingKind, PublishDiagnosticsClientCapabilities,
-    TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities, Uri,
-    WindowClientCapabilities, WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
-    WorkspaceFolder,
+    ClientCapabilities, ClientInfo, CodeActionClientCapabilities, CodeActionKindLiteralSupport,
+    CodeActionLiteralSupport, DocumentFormattingClientCapabilities, FailureHandlingKind,
+    GeneralClientCapabilities, InitializeParams, PositionEncodingKind,
+    PublishDiagnosticsClientCapabilities, TextDocumentClientCapabilities,
+    TextDocumentSyncClientCapabilities, Uri, WindowClientCapabilities, WorkspaceClientCapabilities,
+    WorkspaceEditClientCapabilities, WorkspaceFolder,
 };
 use serde_json::{Map, Value, json};
 use url::Url;
@@ -273,6 +274,20 @@ fn client_capabilities() -> ClientCapabilities {
             related_information: Some(true),
             version_support: Some(true),
             ..PublishDiagnosticsClientCapabilities::default()
+        }),
+        formatting: Some(DocumentFormattingClientCapabilities {
+            dynamic_registration: Some(false),
+        }),
+        // jdtls only returns literal code actions (with an embedded edit) when
+        // the client advertises the kinds it understands.
+        code_action: Some(CodeActionClientCapabilities {
+            dynamic_registration: Some(false),
+            code_action_literal_support: Some(CodeActionLiteralSupport {
+                code_action_kind: CodeActionKindLiteralSupport {
+                    value_set: vec!["source.organizeImports".to_owned()],
+                },
+            }),
+            ..CodeActionClientCapabilities::default()
         }),
         ..TextDocumentClientCapabilities::default()
     };

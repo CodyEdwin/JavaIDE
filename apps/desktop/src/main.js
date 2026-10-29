@@ -3,7 +3,9 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { basicSetup } from "codemirror";
 import { EditorState } from "@codemirror/state";
-import { EditorView, keymap } from "@codemirror/view";
+import { EditorView, hoverTooltip, keymap } from "@codemirror/view";
+import { autocompletion } from "@codemirror/autocomplete";
+import { lintGutter, setDiagnostics } from "@codemirror/lint";
 import { java } from "@codemirror/lang-java";
 import { json } from "@codemirror/lang-json";
 import { oneDark } from "@codemirror/theme-one-dark";
@@ -43,6 +45,16 @@ const state = {
   gradle: null,
   gradleActive: null,
   gradleSettings: loadGradleSettings(),
+  java: {
+    status: "stopped",
+    message: "",
+    pid: null,
+    diagnostics: new Map(),
+    opened: new Set(),
+    versions: new Map(),
+    changeTimers: new Map(),
+    queue: Promise.resolve(),
+  },
   ai: {
     connected: false,
     sessions: [],
@@ -115,12 +127,39 @@ function editorExtensions(path) {
     basicSetup,
     oneDark,
     languageFor(path),
+    lintGutter(),
+    autocompletion({ override: [javaCompletionSource] }),
+    hoverTooltip(javaHoverSource, { hoverTime: 350 }),
     keymap.of([
       {
         key: "Mod-s",
         preventDefault: true,
         run: () => {
           saveActive();
+          return true;
+        },
+      },
+      {
+        key: "F12",
+        preventDefault: true,
+        run: () => {
+          jumpToDefinition();
+          return true;
+        },
+      },
+      {
+        key: "Shift-Alt-f",
+        preventDefault: true,
+        run: () => {
+          formatJavaDocument();
+          return true;
+        },
+      },
+      {
+        key: "Shift-Alt-o",
+        preventDefault: true,
+        run: () => {
+          organizeJavaImports();
           return true;
         },
       },
@@ -135,6 +174,7 @@ function editorExtensions(path) {
         renderTabs();
       }
       updateStatusRight();
+      javaScheduleChange(state.active);
     }),
   ];
 }
@@ -160,6 +200,9 @@ function showActiveDocument() {
   editor.setState(
     EditorState.create({ doc: doc.content, extensions: editorExtensions(doc.path) }),
   );
+  // `setState` drops decorations, so re-apply the cached publications for the
+  // document that just became visible.
+  applyJavaDiagnostics(doc.path);
   updateStatusRight();
 }
 
@@ -181,6 +224,7 @@ async function openFile(entry) {
     renderTabs();
     renderTree();
     showActiveDocument();
+    javaDocumentOpened(path);
     setStatus(`Opened ${entry.name}`);
   } finally {
     clearBusy();
@@ -192,6 +236,7 @@ function closeFile(path, event) {
   const doc = state.docs.get(path);
   if (doc?.dirty && !confirm(`${doc.name} has unsaved changes. Close it?`)) return;
   state.docs.delete(path);
+  javaDocumentClosed(path);
   if (state.active === path) {
     state.active = [...state.docs.keys()].pop() || null;
   }
@@ -237,6 +282,7 @@ async function saveActive() {
     await call("write_file", { path: doc.path, content: doc.content });
     doc.dirty = false;
     renderTabs();
+    javaDocumentSaved(doc.path);
     setStatus(`Saved ${doc.name}`);
   } catch {
     /* status already shows the error */
@@ -250,6 +296,16 @@ function updateStatusRight() {
     if (doc) parts.push(`${doc.name}${doc.dirty ? " •" : ""}`);
   }
   if (state.gradle) parts.push(`Gradle ${state.gradle.gradleVersion}`);
+  if (state.java.status === "ready") {
+    const errors = [...state.java.diagnostics.values()]
+      .flat()
+      .filter((diagnostic) => diagnostic.severity === "error").length;
+    parts.push(errors ? `Java ${errors} error${errors === 1 ? "" : "s"}` : "Java ready");
+  } else if (state.java.status === "starting") {
+    parts.push("Java starting…");
+  } else if (state.java.status === "failed" || state.java.status === "unavailable") {
+    parts.push("Java unavailable");
+  }
   if (state.ai.connected) parts.push("OpenCode ready");
   $("status-right").textContent = parts.join("   ");
 }
@@ -269,6 +325,13 @@ async function openWorkspace(path) {
     state.active = null;
     state.gradle = null;
     setGradleActive(null);
+    for (const timer of state.java.changeTimers.values()) clearTimeout(timer);
+    state.java.diagnostics.clear();
+    state.java.opened.clear();
+    state.java.versions.clear();
+    state.java.changeTimers.clear();
+    state.java.status = "stopped";
+    state.java.message = "Java language server is stopped.";
     $("workspace-path").textContent = view.root;
     $("workspace-path").title = view.root;
     $("gradle-log").textContent = "";
@@ -277,8 +340,10 @@ async function openWorkspace(path) {
     renderTabs();
     showActiveDocument();
     renderGradle();
+    renderJava();
     setStatus(`Workspace: ${view.root}`);
     updateStatusRight();
+    javaRefreshStatus();
   } finally {
     clearBusy();
   }
@@ -626,6 +691,422 @@ async function stopGradle() {
   }
 }
 
+/* ---------------- java language server ---------------- */
+
+const JAVA_LABELS = {
+  stopped: "stopped",
+  starting: "starting…",
+  stopping: "stopping…",
+  ready: "ready",
+  failed: "failed",
+  unavailable: "not available",
+};
+
+function isJavaPath(path) {
+  return typeof path === "string" && path.endsWith(".java");
+}
+
+function javaReady() {
+  return state.java.status === "ready";
+}
+
+function updateJavaStatus(status) {
+  if (!status || typeof status !== "object") return;
+  const previous = state.java.status;
+  state.java.status = status.state || state.java.status;
+  state.java.message = status.message || "";
+  state.java.pid = status.pid ?? null;
+  renderJava();
+  if (state.java.status === "ready" && previous !== "ready") {
+    // A freshly started server knows nothing about the buffers that are open;
+    // re-open them from the editor state rather than the file on disk.
+    state.java.opened.clear();
+    for (const [path, doc] of state.docs) {
+      if (isJavaPath(path)) javaDocumentOpened(path, doc.content);
+    }
+  }
+}
+
+function renderJava() {
+  const summary = $("java-summary");
+  const detail = $("java-detail");
+  if (!summary || !detail) return;
+  const server = state.java;
+  summary.textContent = `jdtls ${JAVA_LABELS[server.status] || server.status}`
+    + (server.pid ? ` · pid ${server.pid}` : "");
+  detail.textContent = server.message || "No language server details.";
+  $("java-start").textContent = server.status === "ready" ? "Restart" : "Start";
+  $("java-start").disabled = server.status === "starting";
+  renderProblems();
+  updateStatusRight();
+}
+
+function appendJavaLog(line) {
+  const log = $("java-log");
+  if (!log) return;
+  log.textContent += `${line}\n`;
+  while (log.textContent.length > 8000) {
+    log.textContent = log.textContent.slice(2000);
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
+function nextJavaVersion(path) {
+  const version = (state.java.versions.get(path) || 0) + 1;
+  state.java.versions.set(path, version);
+  return version;
+}
+
+function queueJava(task) {
+  state.java.queue = state.java.queue.then(task).catch((error) => {
+    if (javaReady()) showError(`Java sync failed: ${error}`);
+  });
+  return state.java.queue;
+}
+
+function javaDocumentOpened(path, text) {
+  if (!isJavaPath(path) || !state.docs.has(path)) return;
+  if (state.java.opened.has(path)) return;
+  state.java.opened.add(path);
+  queueJava(async () => {
+    const doc = state.docs.get(path);
+    if (!doc) return;
+    try {
+      const status = await call("java_open_document", {
+        path,
+        text: typeof text === "string" ? text : doc.content,
+        version: nextJavaVersion(path),
+      });
+      updateJavaStatus(status);
+    } catch (error) {
+      state.java.opened.delete(path);
+      throw error;
+    }
+  });
+}
+
+function javaScheduleChange(path) {
+  if (!isJavaPath(path) || !javaReady() || !state.java.opened.has(path)) return;
+  const existing = state.java.changeTimers.get(path);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(() => {
+    state.java.changeTimers.delete(path);
+    const doc = state.docs.get(path);
+    if (!doc || !javaReady()) return;
+    queueJava(() =>
+      call("java_change_document", {
+        path,
+        text: doc.content,
+        version: nextJavaVersion(path),
+      }),
+    );
+  }, 350);
+  state.java.changeTimers.set(path, timer);
+}
+
+function javaDocumentSaved(path) {
+  if (!isJavaPath(path) || !javaReady()) return;
+  queueJava(() => call("java_save_document", { path }));
+}
+
+function javaDocumentClosed(path) {
+  if (!isJavaPath(path)) return;
+  state.java.opened.delete(path);
+  state.java.versions.delete(path);
+  const timer = state.java.changeTimers.get(path);
+  if (timer) clearTimeout(timer);
+  state.java.changeTimers.delete(path);
+  if (!javaReady()) return;
+  queueJava(() => call("java_close_document", { path }));
+}
+
+async function javaRefreshStatus() {
+  try {
+    updateJavaStatus(await call("java_status"));
+  } catch {
+    /* keep the last known state */
+  }
+}
+
+async function javaToggleServer() {
+  const restart = state.java.status === "ready";
+  setBusy(restart ? "Restarting jdtls…" : "Starting jdtls…");
+  try {
+    updateJavaStatus(await call(restart ? "java_restart" : "java_start"));
+  } catch (error) {
+    showError(String(error));
+  } finally {
+    clearBusy();
+  }
+}
+
+function offsetAt(doc, position) {
+  if (!position) return 0;
+  const lineNumber = Math.min(Math.max((position.line || 0) + 1, 1), doc.lines);
+  const line = doc.line(lineNumber);
+  return line.from + Math.min(Math.max(position.character || 0, 0), line.length);
+}
+
+function applyJavaDiagnostics(path) {
+  if (!editor || state.active !== path) return;
+  const doc = editor.state.doc;
+  const diagnostics = (state.java.diagnostics.get(path) || []).map((diagnostic) => {
+    const from = offsetAt(doc, diagnostic.range?.start);
+    const to = offsetAt(doc, diagnostic.range?.end);
+    return {
+      from: Math.min(from, to),
+      to: Math.max(from, to),
+      severity: diagnostic.severity || "info",
+      message: diagnostic.message || "Java diagnostic",
+      source: diagnostic.source || "jdtls",
+    };
+  });
+  editor.dispatch(setDiagnostics(editor.state, diagnostics));
+}
+
+function handleJavaDiagnostics(payload) {
+  if (!payload || typeof payload.path !== "string") return;
+  state.java.diagnostics.set(
+    payload.path,
+    Array.isArray(payload.diagnostics) ? payload.diagnostics : [],
+  );
+  if (state.active === payload.path) applyJavaDiagnostics(payload.path);
+  renderProblems();
+  updateStatusRight();
+}
+
+function renderProblems() {
+  const container = $("java-problems");
+  if (!container) return;
+  container.replaceChildren();
+  const entries = [];
+  for (const [path, diagnostics] of state.java.diagnostics) {
+    for (const diagnostic of diagnostics) entries.push({ path, diagnostic });
+  }
+  entries.sort(
+    (left, right) =>
+      left.path.localeCompare(right.path) ||
+      (left.diagnostic.range?.start?.line || 0) - (right.diagnostic.range?.start?.line || 0),
+  );
+  if (!entries.length) {
+    container.textContent = javaReady() ? "No problems reported." : "No problems yet.";
+    return;
+  }
+  for (const entry of entries.slice(0, 200)) {
+    const line = (entry.diagnostic.range?.start?.line || 0) + 1;
+    const row = document.createElement("div");
+    row.className = `problem ${entry.diagnostic.severity || "info"}`;
+    row.title = `${entry.path}:${line}\n${entry.diagnostic.message || ""}`;
+    const location = document.createElement("span");
+    location.className = "problem-location";
+    location.textContent = `${fileName(entry.path)}:${line}`;
+    const message = document.createElement("span");
+    message.className = "problem-message";
+    message.textContent = entry.diagnostic.message || "";
+    row.append(location, message);
+    row.addEventListener("click", () => {
+      openAbsoluteFile(
+        entry.path,
+        line - 1,
+        entry.diagnostic.range?.start?.character || 0,
+      );
+    });
+    container.appendChild(row);
+  }
+  if (entries.length > 200) {
+    const more = document.createElement("div");
+    more.className = "panel-note";
+    more.textContent = `… ${entries.length - 200} more problem(s)`;
+    container.appendChild(more);
+  }
+}
+
+async function javaHoverSource(view, pos) {
+  const path = state.active;
+  if (!isJavaPath(path) || !javaReady()) return null;
+  const line = view.state.doc.lineAt(pos);
+  try {
+    const info = await invoke("java_hover", {
+      path,
+      line: line.number - 1,
+      character: pos - line.from,
+    });
+    if (!info?.contents) return null;
+    return {
+      pos,
+      above: true,
+      create() {
+        const dom = document.createElement("div");
+        dom.className = "java-hover";
+        dom.textContent = info.contents;
+        return { dom };
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+function completionName(label) {
+  // jdtls display labels look like `out : PrintStream` or `exit(int) : void`.
+  return label.split(" : ")[0].split("(")[0].trim() || label;
+}
+
+function completionApply(item) {
+  const text = item.insertText;
+  // jdtls snippets contain LSP placeholders such as `${1:name}`; inserting
+  // those literally is worse than inserting the plain identifier.
+  if (typeof text === "string" && text && !text.includes("${")) return text;
+  return completionName(item.label || "");
+}
+
+async function javaCompletionSource(context) {
+  const path = state.active;
+  if (!isJavaPath(path) || !javaReady()) return null;
+  const line = context.state.doc.lineAt(context.pos);
+  try {
+    const items = await invoke("java_completion", {
+      path,
+      line: line.number - 1,
+      character: context.pos - line.from,
+    });
+    if (!Array.isArray(items) || !items.length) return null;
+    const word = context.matchBefore(/[A-Za-z_$][\w$]*/);
+    return {
+      from: word ? word.from : context.pos,
+      options: items.map((item) => ({
+        label: item.label,
+        detail: item.detail || undefined,
+        info: item.documentation || undefined,
+        type: item.kind || "text",
+        apply: completionApply(item),
+      })),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function jumpToDefinition() {
+  const path = state.active;
+  if (!editor || !isJavaPath(path)) return;
+  if (!javaReady()) {
+    setStatus("Java language server is not ready");
+    return;
+  }
+  const pos = editor.state.selection.main.head;
+  const line = editor.state.doc.lineAt(pos);
+  try {
+    const locations = await invoke("java_definition", {
+      path,
+      line: line.number - 1,
+      character: pos - line.from,
+    });
+    if (!Array.isArray(locations) || !locations.length) {
+      setStatus("No definition found at the cursor");
+      return;
+    }
+    const target = locations.find((location) => location.path === path) || locations[0];
+    await openAbsoluteFile(
+      target.path,
+      target.range?.start?.line || 0,
+      target.range?.start?.character || 0,
+    );
+    if (locations.length > 1) setStatus(`${locations.length} definitions available`);
+  } catch (error) {
+    showError(String(error));
+  }
+}
+
+async function openAbsoluteFile(path, line = 0, character = 0) {
+  if (!path.startsWith(`${state.root}/`)) {
+    setStatus(`Definition is outside the workspace: ${path}:${line + 1}`);
+    return;
+  }
+  if (!state.docs.has(path)) {
+    try {
+      const content = await call("read_file", { path });
+      state.docs.set(path, { path, name: fileName(path), content, dirty: false });
+    } catch {
+      return;
+    }
+  }
+  state.active = path;
+  renderTabs();
+  renderTree();
+  showActiveDocument();
+  applyJavaDiagnostics(path);
+  revealLine(line, character);
+  javaDocumentOpened(path);
+}
+
+function revealLine(line, character) {
+  if (!editor) return;
+  const at = offsetAt(editor.state.doc, { line, character });
+  editor.dispatch({ selection: { anchor: at }, scrollIntoView: true });
+  editor.focus();
+}
+
+function applyJavaEdits(edits) {
+  if (!editor || !Array.isArray(edits) || !edits.length) return 0;
+  const doc = editor.state.doc;
+  // CodeMirror applies every change against the original document, so the
+  // list must be sorted ascending; jdtls ranges never overlap.
+  const changes = edits
+    .map((edit) => ({
+      from: offsetAt(doc, edit.range?.start),
+      to: offsetAt(doc, edit.range?.end),
+      insert: edit.newText || "",
+    }))
+    .filter((change) => change.from <= change.to)
+    .sort((left, right) => left.from - right.from);
+  if (!changes.length) return 0;
+  editor.dispatch({ changes });
+  return changes.length;
+}
+
+async function formatJavaDocument() {
+  const path = state.active;
+  if (!editor || !isJavaPath(path)) return;
+  if (!javaReady()) {
+    setStatus("Java language server is not ready");
+    return;
+  }
+  setBusy("Formatting…");
+  try {
+    const edits = await call("java_format_document", {
+      path,
+      tabSize: 4,
+      insertSpaces: true,
+    });
+    const applied = applyJavaEdits(edits);
+    setStatus(applied ? `Formatted ${fileName(path)}` : "Already formatted");
+  } catch (error) {
+    showError(String(error));
+  } finally {
+    clearBusy();
+  }
+}
+
+async function organizeJavaImports() {
+  const path = state.active;
+  if (!editor || !isJavaPath(path)) return;
+  if (!javaReady()) {
+    setStatus("Java language server is not ready");
+    return;
+  }
+  setBusy("Organizing imports…");
+  try {
+    const edits = await call("java_organize_imports", { path });
+    const applied = applyJavaEdits(edits);
+    setStatus(applied ? `Organized imports in ${fileName(path)}` : "Imports already organized");
+  } catch (error) {
+    showError(String(error));
+  } finally {
+    clearBusy();
+  }
+}
+
 /* ---------------- opencode ---------------- */
 
 function aiAppend(role, text, kind = "") {
@@ -893,6 +1374,10 @@ async function boot() {
   renderGradleSettings();
   $("gradle-list-tests").addEventListener("click", discoverTests);
   $("gradle-clear").addEventListener("click", () => ($("gradle-log").textContent = ""));
+  $("java-start").addEventListener("click", javaToggleServer);
+  $("java-format").addEventListener("click", formatJavaDocument);
+  $("java-organize").addEventListener("click", organizeJavaImports);
+  $("java-clear-log").addEventListener("click", () => ($("java-log").textContent = ""));
   $("ai-connect").addEventListener("click", aiConnect);
   $("ai-refresh").addEventListener("click", aiRefreshSessions);
   $("ai-new-session").addEventListener("click", aiNewSession);
@@ -906,6 +1391,20 @@ async function boot() {
   });
 
   await listen("opencode://event", (event) => handleAiEvent(event.payload));
+  await listen("java://diagnostics", (event) => handleJavaDiagnostics(event.payload));
+  await listen("java://event", (event) => {
+    const payload = event.payload;
+    if (!payload) return;
+    if (payload.name === "status") {
+      updateJavaStatus(payload.data);
+      return;
+    }
+    if (payload.name === "log" || payload.name === "status-message") {
+      const message = payload.data?.message;
+      if (message) appendJavaLog(String(message));
+    }
+  });
+  renderJava();
 
   try {
     const root = await call("default_workspace");
