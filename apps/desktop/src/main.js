@@ -13,6 +13,18 @@ import { oneDark } from "@codemirror/theme-one-dark";
 const $ = (id) => document.getElementById(id);
 
 const GRADLE_SETTINGS_KEY = "javaide.gradle.settings";
+const PROBLEM_FILTER_KEY = "javaide.problems.filter";
+
+const PROBLEM_FILTERS = new Set(["all", "error", "warning", "info"]);
+
+function loadProblemFilter() {
+  try {
+    const stored = localStorage.getItem(PROBLEM_FILTER_KEY);
+    return PROBLEM_FILTERS.has(stored) ? stored : "all";
+  } catch {
+    return "all";
+  }
+}
 
 function loadGradleSettings() {
   const defaults = {
@@ -54,6 +66,8 @@ const state = {
     versions: new Map(),
     changeTimers: new Map(),
     queue: Promise.resolve(),
+    problemFilter: loadProblemFilter(),
+    collapsedProblems: new Set(),
   },
   ai: {
     connected: false,
@@ -112,6 +126,14 @@ function join(root, relative) {
 
 function fileName(path) {
   return path.split("/").pop();
+}
+
+function workspaceRelative(path) {
+  if (!state.root) return path;
+  const root = state.root.replace(/[\\/]+$/, "").replace(/\\/g, "/");
+  const normalized = String(path).replace(/\\/g, "/");
+  const prefix = `${root}/`;
+  return normalized.startsWith(prefix) ? normalized.slice(prefix.length) : String(path);
 }
 
 /* ---------------- editor ---------------- */
@@ -330,6 +352,7 @@ async function openWorkspace(path) {
     state.java.opened.clear();
     state.java.versions.clear();
     state.java.changeTimers.clear();
+    state.java.collapsedProblems.clear();
     state.java.status = "stopped";
     state.java.message = "Java language server is stopped.";
     $("workspace-path").textContent = view.root;
@@ -810,6 +833,10 @@ function javaDocumentSaved(path) {
 }
 
 function javaDocumentClosed(path) {
+  state.java.diagnostics.delete(path);
+  state.java.collapsedProblems.delete(path);
+  renderProblems();
+  updateStatusRight();
   if (!isJavaPath(path)) return;
   state.java.opened.delete(path);
   state.java.versions.delete(path);
@@ -866,59 +893,219 @@ function applyJavaDiagnostics(path) {
 
 function handleJavaDiagnostics(payload) {
   if (!payload || typeof payload.path !== "string") return;
-  state.java.diagnostics.set(
-    payload.path,
-    Array.isArray(payload.diagnostics) ? payload.diagnostics : [],
-  );
+  const diagnostics = Array.isArray(payload.diagnostics) ? payload.diagnostics : [];
+  // An empty publication means the file is clean; drop the entry instead of
+  // keeping a file group with nothing in it.
+  if (diagnostics.length) state.java.diagnostics.set(payload.path, diagnostics);
+  else state.java.diagnostics.delete(payload.path);
   if (state.active === payload.path) applyJavaDiagnostics(payload.path);
   renderProblems();
   updateStatusRight();
 }
 
+const SEVERITY_ICONS = { error: "✖", warning: "▲", info: "ℹ", hint: "ℹ" };
+const SEVERITY_LABELS = { error: "Error", warning: "Warning", info: "Info", hint: "Hint" };
+
+function problemEntries() {
+  const entries = [];
+  for (const [path, diagnostics] of state.java.diagnostics) {
+    for (const diagnostic of diagnostics) {
+      entries.push({
+        path,
+        diagnostic,
+        severity: diagnostic.severity || "info",
+      });
+    }
+  }
+  return entries;
+}
+
+function problemCounts(entries) {
+  const counts = { error: 0, warning: 0, info: 0, hint: 0 };
+  for (const entry of entries) {
+    counts[entry.severity] = (counts[entry.severity] || 0) + 1;
+  }
+  return counts;
+}
+
+function problemMatchesFilter(severity) {
+  const filter = state.java.problemFilter;
+  if (filter === "all") return true;
+  if (filter === "info") return severity === "info" || severity === "hint";
+  return severity === filter;
+}
+
+function problemSummary(counts, total) {
+  if (!total) return javaReady() ? "No problems reported." : "No problems yet.";
+  const parts = [];
+  const push = (count, singular, plural) => {
+    if (count) parts.push(`${count} ${count === 1 ? singular : plural}`);
+  };
+  push(counts.error, "error", "errors");
+  push(counts.warning, "warning", "warnings");
+  push(counts.info + counts.hint, "info", "info");
+  return parts.join(" · ");
+}
+
+function updateProblemFilterLabels(counts) {
+  const select = $("java-problem-filter");
+  if (!select) return;
+  const totals = {
+    all: counts.error + counts.warning + counts.info + counts.hint,
+    error: counts.error,
+    warning: counts.warning,
+    info: counts.info + counts.hint,
+  };
+  const base = { all: "All", error: "Errors", warning: "Warnings", info: "Info" };
+  for (const option of select.options) {
+    const label = base[option.value] || option.value;
+    option.textContent = totals[option.value] ? `${label} (${totals[option.value]})` : label;
+  }
+  if (select.value !== state.java.problemFilter) select.value = state.java.problemFilter;
+}
+
+function problemGroup(path, entries) {
+  const group = document.createElement("div");
+  group.className = "problem-group";
+  const collapsed = state.java.collapsedProblems.has(path);
+  const header = document.createElement("div");
+  header.className = "problem-file";
+  header.title = path;
+  const caret = document.createElement("span");
+  caret.className = "problem-file-caret";
+  caret.textContent = collapsed ? "▸" : "▾";
+  const name = document.createElement("span");
+  name.className = "problem-file-name";
+  name.textContent = workspaceRelative(path);
+  header.append(caret, name);
+  const counts = problemCounts(entries);
+  for (const severity of ["error", "warning", "info", "hint"]) {
+    if (!counts[severity]) continue;
+    const badge = document.createElement("span");
+    badge.className = `problem-count ${severity}`;
+    badge.textContent = String(counts[severity]);
+    badge.title = `${counts[severity]} ${SEVERITY_LABELS[severity].toLowerCase()}${counts[severity] === 1 ? "" : "s"}`;
+    header.appendChild(badge);
+  }
+  header.addEventListener("click", () => {
+    if (state.java.collapsedProblems.has(path)) state.java.collapsedProblems.delete(path);
+    else state.java.collapsedProblems.add(path);
+    renderProblems();
+  });
+  group.appendChild(header);
+  if (!collapsed) for (const entry of entries) group.appendChild(problemEntry(entry));
+  return group;
+}
+
+function problemEntry(entry) {
+  const { path, diagnostic, severity } = entry;
+  const start = diagnostic.range?.start || { line: 0, character: 0 };
+  const line = start.line || 0;
+  const character = start.character || 0;
+  const wrapper = document.createElement("div");
+  wrapper.className = "problem-entry";
+  const row = document.createElement("div");
+  row.className = `problem ${severity}`;
+  row.title = `${path}:${line + 1}:${character + 1}\n${diagnostic.message || ""}`;
+  const icon = document.createElement("span");
+  icon.className = "problem-severity";
+  icon.textContent = SEVERITY_ICONS[severity] || "•";
+  icon.title = SEVERITY_LABELS[severity] || severity;
+  const location = document.createElement("span");
+  location.className = "problem-location";
+  location.textContent = `${line + 1}:${character + 1}`;
+  const message = document.createElement("span");
+  message.className = "problem-message";
+  message.textContent = diagnostic.message || "";
+  row.append(icon, location, message);
+  if (diagnostic.code) {
+    const code = document.createElement("span");
+    code.className = "problem-code";
+    code.textContent = diagnostic.code;
+    code.title = `Diagnostic code: ${diagnostic.code}`;
+    row.appendChild(code);
+  }
+  row.addEventListener("click", () => openAbsoluteFile(path, line, character));
+  wrapper.appendChild(row);
+
+  const related = Array.isArray(diagnostic.relatedInformation)
+    ? diagnostic.relatedInformation
+    : [];
+  if (related.length) {
+    const list = document.createElement("div");
+    list.className = "problem-related-list";
+    for (const info of related.slice(0, 5)) {
+      const relatedStart = info.range?.start || { line: 0, character: 0 };
+      const item = document.createElement("div");
+      item.className = "problem-related";
+      item.title = info.path;
+      item.textContent = `↳ ${workspaceRelative(info.path)}:${(relatedStart.line || 0) + 1} — ${info.message || ""}`;
+      item.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openAbsoluteFile(info.path, relatedStart.line || 0, relatedStart.character || 0);
+      });
+      list.appendChild(item);
+    }
+    if (related.length > 5) {
+      const more = document.createElement("div");
+      more.className = "problem-related";
+      more.textContent = `… ${related.length - 5} more related location(s)`;
+      list.appendChild(more);
+    }
+    wrapper.appendChild(list);
+  }
+  return wrapper;
+}
+
 function renderProblems() {
   const container = $("java-problems");
   if (!container) return;
+  const all = problemEntries();
+  const counts = problemCounts(all);
+  updateProblemFilterLabels(counts);
+  const summary = $("java-problem-summary");
+  if (summary) summary.textContent = problemSummary(counts, all.length);
+
+  const visible = all.filter((entry) => problemMatchesFilter(entry.severity));
   container.replaceChildren();
-  const entries = [];
-  for (const [path, diagnostics] of state.java.diagnostics) {
-    for (const diagnostic of diagnostics) entries.push({ path, diagnostic });
-  }
-  entries.sort(
-    (left, right) =>
-      left.path.localeCompare(right.path) ||
-      (left.diagnostic.range?.start?.line || 0) - (right.diagnostic.range?.start?.line || 0),
-  );
-  if (!entries.length) {
-    container.textContent = javaReady() ? "No problems reported." : "No problems yet.";
+  if (!visible.length) {
+    const empty = document.createElement("div");
+    empty.className = "panel-note";
+    empty.textContent = all.length
+      ? "No problems match the current filter."
+      : javaReady()
+        ? "No problems reported."
+        : "No problems yet.";
+    container.appendChild(empty);
     return;
   }
-  for (const entry of entries.slice(0, 200)) {
-    const line = (entry.diagnostic.range?.start?.line || 0) + 1;
-    const row = document.createElement("div");
-    row.className = `problem ${entry.diagnostic.severity || "info"}`;
-    row.title = `${entry.path}:${line}\n${entry.diagnostic.message || ""}`;
-    const location = document.createElement("span");
-    location.className = "problem-location";
-    location.textContent = `${fileName(entry.path)}:${line}`;
-    const message = document.createElement("span");
-    message.className = "problem-message";
-    message.textContent = entry.diagnostic.message || "";
-    row.append(location, message);
-    row.addEventListener("click", () => {
-      openAbsoluteFile(
-        entry.path,
-        line - 1,
-        entry.diagnostic.range?.start?.character || 0,
-      );
-    });
-    container.appendChild(row);
+
+  const groups = new Map();
+  for (const entry of visible) {
+    const list = groups.get(entry.path) || [];
+    list.push(entry);
+    groups.set(entry.path, list);
   }
-  if (entries.length > 200) {
-    const more = document.createElement("div");
-    more.className = "panel-note";
-    more.textContent = `… ${entries.length - 200} more problem(s)`;
-    container.appendChild(more);
+  const paths = [...groups.keys()].sort((left, right) =>
+    workspaceRelative(left).localeCompare(workspaceRelative(right)),
+  );
+  for (const path of paths) {
+    const entries = groups.get(path).sort(
+      (left, right) =>
+        (left.diagnostic.range?.start?.line || 0) - (right.diagnostic.range?.start?.line || 0) ||
+        (left.diagnostic.range?.start?.character || 0) -
+          (right.diagnostic.range?.start?.character || 0),
+    );
+    container.appendChild(problemGroup(path, entries));
   }
+}
+
+function clearJavaProblems() {
+  state.java.diagnostics.clear();
+  state.java.collapsedProblems.clear();
+  if (editor) editor.dispatch(setDiagnostics(editor.state, []));
+  renderProblems();
+  updateStatusRight();
 }
 
 async function javaHoverSource(view, pos) {
@@ -1378,6 +1565,20 @@ async function boot() {
   $("java-format").addEventListener("click", formatJavaDocument);
   $("java-organize").addEventListener("click", organizeJavaImports);
   $("java-clear-log").addEventListener("click", () => ($("java-log").textContent = ""));
+  const problemFilter = $("java-problem-filter");
+  problemFilter.value = state.java.problemFilter;
+  problemFilter.addEventListener("change", () => {
+    state.java.problemFilter = PROBLEM_FILTERS.has(problemFilter.value)
+      ? problemFilter.value
+      : "all";
+    try {
+      localStorage.setItem(PROBLEM_FILTER_KEY, state.java.problemFilter);
+    } catch {
+      /* storage can be unavailable; the filter still works for this session */
+    }
+    renderProblems();
+  });
+  $("java-clear-problems").addEventListener("click", clearJavaProblems);
   $("ai-connect").addEventListener("click", aiConnect);
   $("ai-refresh").addEventListener("click", aiRefreshSessions);
   $("ai-new-session").addEventListener("click", aiNewSession);

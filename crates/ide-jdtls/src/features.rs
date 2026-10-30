@@ -18,9 +18,10 @@
 use std::path::PathBuf;
 
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionResponse, Diagnostic, DiagnosticSeverity,
-    Documentation, GotoDefinitionResponse, Hover, HoverContents, Location, MarkedString,
-    NumberOrString, Position, PublishDiagnosticsParams, Range, TextEdit, Uri, WorkspaceEdit,
+    CompletionItem, CompletionItemKind, CompletionResponse, Diagnostic,
+    DiagnosticRelatedInformation, DiagnosticSeverity, Documentation, GotoDefinitionResponse, Hover,
+    HoverContents, Location, MarkedString, NumberOrString, Position, PublishDiagnosticsParams,
+    Range, TextEdit, Uri, WorkspaceEdit,
 };
 use serde::{Deserialize, Serialize};
 
@@ -139,6 +140,22 @@ pub struct SourceLocation {
     pub range: SourceRange,
 }
 
+/// A secondary location attached to a diagnostic.
+///
+/// jdtls uses these to explain a problem with another declaration, for example
+/// the overridden method or the conflicting type. Related locations with a
+/// non-`file:` URI are dropped, matching [`JavaDiagnostic`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JavaRelatedInformation {
+    /// Absolute filesystem path of the related document.
+    pub path: PathBuf,
+    /// Range inside that document.
+    pub range: SourceRange,
+    /// Message explaining the relation.
+    pub message: String,
+}
+
 /// One diagnostic for a document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -153,6 +170,8 @@ pub struct JavaDiagnostic {
     pub source: Option<String>,
     /// Stable diagnostic code, when jdtls supplies one.
     pub code: Option<String>,
+    /// Secondary locations that explain the diagnostic.
+    pub related_information: Vec<JavaRelatedInformation>,
 }
 
 /// The full diagnostic publication for one document.
@@ -189,7 +208,22 @@ fn java_diagnostic(diagnostic: &Diagnostic) -> JavaDiagnostic {
         message: diagnostic.message.clone(),
         source: diagnostic.source.clone(),
         code: diagnostic.code.as_ref().map(code_text),
+        related_information: diagnostic
+            .related_information
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(java_related_information)
+            .collect(),
     }
+}
+
+fn java_related_information(info: &DiagnosticRelatedInformation) -> Option<JavaRelatedInformation> {
+    Some(JavaRelatedInformation {
+        path: uri_to_path(&info.location.uri).ok()?,
+        range: info.location.range.into(),
+        message: info.message.clone(),
+    })
 }
 
 fn severity_name(severity: Option<DiagnosticSeverity>) -> &'static str {
@@ -373,9 +407,9 @@ pub(crate) fn workspace_text_edits(edit: &WorkspaceEdit, uri: &Uri) -> Vec<Sourc
 #[cfg(test)]
 mod tests {
     use lsp_types::{
-        Diagnostic, DiagnosticSeverity, Hover, HoverContents, Location, LocationLink,
-        MarkupContent, MarkupKind, NumberOrString, Position, PublishDiagnosticsParams, Range,
-        TextEdit, Uri, WorkspaceEdit,
+        Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Hover, HoverContents,
+        Location, LocationLink, MarkupContent, MarkupKind, NumberOrString, Position,
+        PublishDiagnosticsParams, Range, TextEdit, Uri, WorkspaceEdit,
     };
 
     use super::*;
@@ -529,7 +563,22 @@ mod tests {
                 code_description: None,
                 source: Some("Java".to_owned()),
                 message: "The value is unused".to_owned(),
-                related_information: None,
+                related_information: Some(vec![
+                    DiagnosticRelatedInformation {
+                        location: Location {
+                            uri: uri("file:///tmp/Other.java"),
+                            range: range((4, 1), (4, 9)),
+                        },
+                        message: "declared here".to_owned(),
+                    },
+                    DiagnosticRelatedInformation {
+                        location: Location {
+                            uri: uri("jdt://contents/java.base/java/lang/String.class"),
+                            range: range((0, 0), (0, 1)),
+                        },
+                        message: "virtual document".to_owned(),
+                    },
+                ]),
                 tags: None,
                 data: None,
             }],
@@ -541,6 +590,15 @@ mod tests {
         assert_eq!(view.diagnostics[0].severity, "error");
         assert_eq!(view.diagnostics[0].code.as_deref(), Some("unused"));
         assert_eq!(view.diagnostics[0].range.end, SourcePosition::new(1, 5));
+        assert_eq!(view.diagnostics[0].related_information.len(), 1);
+        assert_eq!(
+            view.diagnostics[0].related_information[0].path,
+            PathBuf::from("/tmp/Other.java")
+        );
+        assert_eq!(
+            view.diagnostics[0].related_information[0].message,
+            "declared here"
+        );
     }
 
     #[test]

@@ -43,7 +43,19 @@
             </div>
             <div id="java-summary" class="panel-note">jdtls stopped</div>
             <div id="java-detail" class="panel-note java-detail"></div>
-            <div class="panel-header sub"><span>Problems</span></div>
+            <div class="panel-header sub">
+              <span>Problems</span>
+              <div class="panel-actions">
+                <select id="java-problem-filter" class="problem-filter" title="Filter problems by severity">
+                  <option value="all">All</option>
+                  <option value="error">Errors</option>
+                  <option value="warning">Warnings</option>
+                  <option value="info">Info</option>
+                </select>
+                <button id="java-clear-problems" class="text-button" title="Clear the problem list">Clear</button>
+              </div>
+            </div>
+            <div id="java-problem-summary" class="problem-summary"></div>
             <div id="java-problems" class="problem-list"></div>
             <div class="panel-header sub">
               <span>Server log</span>
