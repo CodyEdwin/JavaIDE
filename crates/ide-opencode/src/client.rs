@@ -725,7 +725,7 @@ mod tests {
                 }
                 request.extend_from_slice(&buffer[..read]);
                 if let Some(end) = find_header_end(&request) {
-                    let headers = String::from_utf8_lossy(&request[..end]).to_owned();
+                    let headers = String::from_utf8_lossy(&request[..end]).into_owned();
                     let content_length = headers
                         .lines()
                         .find_map(|line| {

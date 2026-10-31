@@ -94,6 +94,9 @@ pub struct JdtlsConfig {
     pub bundles: Vec<PathBuf>,
     /// Additional JVM arguments appended after the defaults.
     pub vm_args: Vec<String>,
+    /// Settings document sent as `initializationOptions.settings` and served
+    /// from `workspace/configuration`. An empty object means "no preferences".
+    pub settings: Value,
     /// Additional jdtls arguments appended after `-data`.
     pub extra_args: Vec<String>,
     /// OSGi log level passed as `-Dlog.level` (for example `WARN`).
@@ -120,6 +123,7 @@ impl JdtlsConfig {
             workspace_root: workspace_root.into(),
             bundles: Vec::new(),
             vm_args: Vec::new(),
+            settings: Value::Object(Map::new()),
             extra_args: Vec::new(),
             log_level: "WARN".to_owned(),
             initialize_timeout: std::time::Duration::from_secs(120),
@@ -204,6 +208,9 @@ impl JdtlsConfig {
                 .map(|bundle| bundle.display().to_string())
                 .collect();
             options.insert("bundles".to_owned(), json!(bundles));
+        }
+        if !self.settings.is_null() {
+            options.insert("settings".to_owned(), self.settings.clone());
         }
         params.initialization_options = Some(Value::Object(options));
         Ok(params)
@@ -415,6 +422,8 @@ pub fn is_launcher_jar(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -435,6 +444,24 @@ mod tests {
         assert!(!is_launcher_jar(Path::new(
             "org.eclipse.equinox.launcher.jar"
         )));
+    }
+
+    #[test]
+    fn initialize_params_include_settings() {
+        let config = JdtlsConfig::new(
+            "/tmp/java",
+            JdtlsInstallation::new("/tmp/jdtls", "/tmp/launcher.jar", "/tmp/config"),
+            "/tmp/data",
+            "/tmp/workspace",
+        );
+        let mut config = config;
+        config.settings = json!({ "java": { "format": { "enabled": false } } });
+        let params = config.initialize_params().expect("params");
+        let options = params.initialization_options.expect("options");
+        assert_eq!(
+            options["settings"]["java"]["format"]["enabled"],
+            json!(false)
+        );
     }
 
     #[test]

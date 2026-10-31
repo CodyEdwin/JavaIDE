@@ -1,0 +1,8 @@
+/target/
+**/target/
+apps/desktop/node_modules/.vite/
+**/.gradle/
+sidecar/gradle-bridge/build/
+fixtures/java-gradle/build/
+*.log
+.DS_Store

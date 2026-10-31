@@ -532,6 +532,8 @@ mod tests {
     #[test]
     fn extracts_edits_for_the_requested_document() {
         let document = uri("file:///tmp/App.java");
+        // See `apply_workspace_edit`: `Uri` interior mutability is a parse cache.
+        #[allow(clippy::mutable_key_type)]
         let mut changes = std::collections::HashMap::new();
         changes.insert(
             document.clone(),

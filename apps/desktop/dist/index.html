@@ -4,21 +4,28 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>JavaIDE</title>
-    <script type="module" crossorigin src="/assets/index-BkwTbTtA.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-TyS-UIv8.css">
+    <script type="module" crossorigin src="/assets/index-Cxnzb8Kg.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-CdmYW9wO.css">
   </head>
   <body>
     <div id="app">
       <header id="titlebar">
         <div class="brand"><span class="brand-mark">J</span> JavaIDE</div>
         <button id="open-folder" class="toolbar-button">Open Folder</button>
+        <button id="compile-java" class="toolbar-button" title="Run the Gradle compileJava task">Compile</button>
+        <button id="run-java" class="toolbar-button" title="Run the Gradle application">Run</button>
+        <button id="test-java" class="toolbar-button" title="Run Gradle tests">Test</button>
+        <button id="command-palette" class="toolbar-button" title="Command palette (Ctrl+Shift+P)">Commands</button>
         <span id="workspace-path" class="workspace-path"></span>
         <span id="busy" class="busy hidden">working…</span>
       </header>
 
+      <div id="trust-banner" class="trust-banner hidden"></div>
+
       <div id="body">
         <nav id="activity">
           <button class="activity-button active" data-panel="files" title="Explorer">▤</button>
+          <button class="activity-button" data-panel="java" title="Java language server">J</button>
           <button class="activity-button" data-panel="gradle" title="Gradle">G</button>
           <button class="activity-button" data-panel="ai" title="OpenCode">AI</button>
         </nav>
@@ -30,6 +37,67 @@
               <button id="refresh-files" class="icon-button" title="Refresh">⟳</button>
             </div>
             <div id="file-tree" class="file-tree"></div>
+          </section>
+
+          <section id="panel-java" class="panel hidden">
+            <div class="panel-header">
+              <span>Java</span>
+              <div class="panel-actions">
+                <button id="java-format" class="text-button" title="Format document (Shift+Alt+F)">Format</button>
+                <button id="java-organize" class="text-button" title="Organize imports (Shift+Alt+O)">Imports</button>
+                <button id="java-start" class="text-button">Start</button>
+              </div>
+            </div>
+            <div id="java-summary" class="panel-note">jdtls stopped</div>
+            <div id="java-detail" class="panel-note java-detail"></div>
+            <div class="panel-header sub">
+              <span>Settings</span>
+              <button id="java-settings-toggle" class="text-button">Edit</button>
+            </div>
+            <form id="java-settings" class="java-settings hidden">
+              <label class="java-setting"><input type="checkbox" id="java-format-enabled" /> Format enabled</label>
+              <label class="java-setting"><input type="checkbox" id="java-completion-enabled" /> Completion enabled</label>
+              <label class="java-setting"><input type="checkbox" id="java-guess-arguments" /> Guess method arguments</label>
+              <label class="java-setting-label" for="java-favorites">Favorite static members</label>
+              <textarea id="java-favorites" rows="3" spellcheck="false" placeholder="One member pattern per line"></textarea>
+              <label class="java-setting-label" for="java-import-order">Import order</label>
+              <textarea id="java-import-order" rows="3" spellcheck="false" placeholder="One group per line; a blank line is the catch-all"></textarea>
+              <label class="java-setting-label" for="java-vmargs">jdtls VM arguments</label>
+              <input id="java-vmargs" type="text" spellcheck="false" placeholder="-Xmx2G" />
+              <div class="java-settings-row">
+                <label for="java-settings-scope">Save to</label>
+                <select id="java-settings-scope">
+                  <option value="user">User settings</option>
+                  <option value="workspace">This workspace</option>
+                </select>
+                <button id="java-settings-save" class="text-button" type="button">Save</button>
+              </div>
+              <div id="java-settings-note" class="gradle-settings-hint"></div>
+            </form>
+            <div class="panel-header sub">
+              <span>Problems</span>
+              <div class="panel-actions">
+                <select id="java-problem-filter" class="problem-filter" title="Filter problems by severity">
+                  <option value="all">All</option>
+                  <option value="error">Errors</option>
+                  <option value="warning">Warnings</option>
+                  <option value="info">Info</option>
+                </select>
+                <button id="java-clear-problems" class="text-button" title="Clear the problem list">Clear</button>
+              </div>
+            </div>
+            <div id="java-problem-summary" class="problem-summary"></div>
+            <div id="java-problems" class="problem-list"></div>
+            <div class="panel-header sub">
+              <span>Server log</span>
+              <button id="java-clear-log" class="text-button">Clear</button>
+            </div>
+            <pre id="java-log" class="log"></pre>
+            <div class="panel-header sub">
+              <span>Debug log</span>
+              <button id="java-show-debug" class="text-button" title="Show buffered jdtls debug output">Show</button>
+            </div>
+            <pre id="java-debug-log" class="log debug-log hidden"></pre>
           </section>
 
           <section id="panel-gradle" class="panel hidden">
@@ -96,13 +164,21 @@
 
         <main id="main">
           <div id="tabs" class="tabs"></div>
-          <div id="editor"></div>
+          <div id="editor-split">
+            <div id="editor" class="editor-pane"></div>
+            <div id="editor-secondary" class="editor-pane hidden"></div>
+          </div>
           <div id="welcome" class="welcome">
             <h1>JavaIDE</h1>
             <p>Rust core · jdtls · Gradle Tooling API · OpenCode V2</p>
             <p class="hint">Open a file from the explorer to start editing.</p>
           </div>
         </main>
+      </div>
+
+      <div id="palette" class="palette hidden" role="dialog" aria-label="Command palette">
+        <input id="palette-input" type="text" spellcheck="false" placeholder="Type a command or file name" />
+        <div id="palette-list"></div>
       </div>
 
       <footer id="statusbar">

@@ -3,10 +3,12 @@ resolver = "3"
 members = [
   "crates/ide-jsonrpc",
   "crates/ide-platform",
+  "crates/ide-config",
   "crates/ide-jdtls",
   "crates/ide-gradle",
   "crates/ide-opencode",
   "crates/ide-phase0",
+  "crates/xtask",
   "apps/desktop/src-tauri",
 ]
 
@@ -32,6 +34,7 @@ tokio-tungstenite = "0.30"
 base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
 url = "2"
 
 [workspace.lints.rust]

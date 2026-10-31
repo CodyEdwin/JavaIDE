@@ -7,14 +7,16 @@ The Java intelligence is provided by the
 [Eclipse JDT Language Server (jdtls)](https://github.com/eclipse-jdtls/eclipse.jdt.ls).
 The IDE does not reimplement javac, a Java parser, or a Gradle build engine.
 
-> **Status: Phase 1 in progress.** The repository contains the design set, the
-> Rust/Java integration crates, and a Tauri desktop shell with editor, Gradle,
-> Java, and OpenCode panels. jdtls diagnostics, completion, hover,
-> go-to-definition, formatting, and organize imports are wired into the shell;
-> the remaining Phase 1 checklist is
-> tracked in [docs/PHASE1_STATUS.md](docs/PHASE1_STATUS.md).
+> **Status: Phase 1 core is usable.** The desktop shell edits files, gates
+> Gradle and jdtls behind an explicit trust decision, and can compile, run, and
+> test a Gradle project. Full jdtls breadth (rename, hierarchy, semantic tokens)
+> is Phase 2. The checklist is in
+> [docs/PHASE1_STATUS.md](docs/PHASE1_STATUS.md).
 
 ## Run the desktop shell
+
+Rust 1.88 is pinned in `rust-toolchain.toml`. You need Node 20+, a JDK 17+
+(21 recommended), and on Linux the GTK 3 and WebKitGTK 4.1 development packages.
 
 ```sh
 cd sidecar/gradle-bridge && ./gradlew installDist && cd -
@@ -24,8 +26,30 @@ cd apps/desktop && npm install && npm run tauri dev
 The shell opens `fixtures/java-gradle` by default. Use **Open Folder** for
 another workspace, or set `JAVAIDE_WORKSPACE=/absolute/path` before launch. The
 Gradle bridge is restarted for each workspace, so the panel always describes the
-currently open project. Gradle needs a Java 17+ JDK; OpenCode is discovered from
-the local V2 service.
+currently open project. JDKs are taken from `JAVA_HOME`, then common Temurin
+paths, then a scan of `/usr/lib/jvm` and `/Library/Java/JavaVirtualMachines`.
+OpenCode is discovered from the local V2 service and is optional.
+
+The first time a folder opens, the banner asks you to trust it. Until you do,
+the editor still works, and Gradle, jdtls, and OpenCode stay off. **Compile**,
+**Run**, and **Test** invoke the Gradle `compileJava`, `run`, and `test` tasks
+for the trusted project. `Ctrl/Cmd+Shift+P` opens the command palette and
+`Ctrl/Cmd+P` opens a file. `Ctrl/Cmd+\` splits the editor. Java settings
+(format, completion, jdtls VM arguments) are edited from the Java panel and
+saved under `$XDG_CONFIG_HOME/javaide/settings.toml`, or in
+`<workspace>/.javaide/settings.toml` when the scope is this workspace. VM
+arguments apply the next time jdtls starts.
+
+Checks:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo run -p xtask -- check-architecture
+cd sidecar/gradle-bridge && ./gradlew test
+cd apps/desktop && npm run build
+```
 
 ## Product shape
 
@@ -89,12 +113,14 @@ assumptions. See [ROADMAP.md](docs/ROADMAP.md) for the gates.
 
 ## Near-term plan
 
-1. **Phase 0 (2 weeks):** prove jdtls, Gradle Tooling API, and OpenCode V2 from
-   Rust; record protocol traces; update ADRs. See
-   [ROADMAP.md](docs/ROADMAP.md#3-phase-0--risk-retirement-2-weeks).
-2. **Phase 1:** Tauri shell, editor/workspace, basic LSP, OpenCode chat.
-3. **Phase 2:** complete jdtls feature surface and OpenCode context/permissions.
-4. **Phase 3+:** Gradle depth, run/test, debugger, assistant depth, release.
+1. **Phase 0:** done. jdtls, the Gradle Tooling API sidecar, and OpenCode V2
+   are proven from Rust. See [PHASE0_REPORT.md](docs/PHASE0_REPORT.md).
+2. **Phase 1:** the shell, editor, basic LSP, trust, settings, command palette,
+   and Gradle compile/run/test are in place. Multi-root workspaces and the
+   `ide-ui-api` TypeScript bindings are still ahead. See
+   [PHASE1_STATUS.md](docs/PHASE1_STATUS.md).
+3. **Phase 2:** complete the jdtls feature surface and OpenCode context/permissions.
+4. **Phase 3+:** Gradle depth, run configurations, debugger, assistant depth, release.
 
 ## Non-goals for v1
 

@@ -1659,6 +1659,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ide-config"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "toml 0.8.2",
+]
+
+[[package]]
 name = "ide-gradle"
 version = "0.0.0"
 dependencies = [
@@ -1828,9 +1838,11 @@ name = "javaide-desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ide-config",
  "ide-gradle",
  "ide-jdtls",
  "ide-opencode",
+ "ide-platform",
  "serde",
  "serde_json",
  "tauri",
@@ -5357,6 +5369,14 @@ dependencies = [
  "libc",
  "once_cell",
  "pkg-config",
+]
+
+[[package]]
+name = "xtask"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
 ]
 
 [[package]]

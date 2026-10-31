@@ -4,6 +4,7 @@
 //! owns presentation only; files, Gradle, and OpenCode all go through these
 //! commands.
 
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,15 +14,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ide_gradle::{
-    BuildSnapshot, GradleClient, GradleOptions, RunTaskRequest, RunTaskResult, RunTestsRequest,
-    RunTestsResult, TestListing,
+    BuildSnapshot, GradleClient, GradleEvent, GradleOptions, RunTaskRequest, RunTaskResult,
+    RunTestsRequest, RunTestsResult, TestListing,
 };
 use ide_jdtls::{
     CompletionCandidate, HoverInfo, JdtlsClient, JdtlsConfig, JdtlsEvent, JdtlsInstallation,
     SourceLocation, SourcePosition, SourceTextEdit,
 };
 use ide_opencode::{CreateSession, DiscoveredService, OpenCodeClient, PromptInput};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{Mutex, broadcast};
@@ -29,6 +30,7 @@ use tokio::sync::{Mutex, broadcast};
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TREE_ENTRIES: usize = 4000;
 const MAX_GRADLE_ARGUMENTS: usize = 64;
+const DEBUG_LOG_CAPACITY: usize = 200;
 
 struct AppState {
     workspace: RwLock<PathBuf>,
@@ -37,6 +39,10 @@ struct AppState {
     gradle_next_id: AtomicU64,
     opencode: Mutex<Option<Arc<OpenCodeClient>>>,
     java: Mutex<JavaSession>,
+    /// `window/logMessage` lines at LSP level 4 (log/debug). Warn and error
+    /// stay on the Java panel; this ring keeps the panel from filling with
+    /// server chatter.
+    debug_log: std::sync::Mutex<VecDeque<String>>,
 }
 
 /// Lifecycle state of the Java language server for the open workspace.
@@ -111,6 +117,7 @@ impl AppState {
             gradle_next_id: AtomicU64::new(1),
             opencode: Mutex::new(None),
             java: Mutex::new(JavaSession::stopped()),
+            debug_log: std::sync::Mutex::new(VecDeque::new()),
         }
     }
 
@@ -167,6 +174,7 @@ struct FileEntry {
 struct WorkspaceView {
     root: String,
     files: Vec<FileEntry>,
+    trust: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,20 +231,12 @@ async fn open_workspace(
     // next sync starts. A run that is already unwinding only clears the active
     // slot when its own request id still matches, so it cannot clobber a newer
     // operation.
-    let active = state.gradle_active.lock().await.clone();
-    let previous = state.gradle.lock().await.take();
-    if let Some(active) = active {
-        if let Some(client) = previous.as_ref() {
-            let _ = client.cancel(&active.request_id).await;
-        }
-        *state.gradle_active.lock().await = None;
-    }
-    if let Some(client) = previous {
-        let _ = client.shutdown().await;
-    }
+    stop_gradle(&state).await;
+    let trust = trust_label(&root);
     Ok(WorkspaceView {
         root: root.to_string_lossy().into_owned(),
         files,
+        trust,
     })
 }
 
@@ -305,10 +305,11 @@ struct GradleCancelResult {
 
 #[tauri::command]
 async fn gradle_sync(
+    app: AppHandle,
     state: State<'_, AppState>,
     arguments: Option<Vec<String>>,
 ) -> Result<BuildSnapshot, String> {
-    let client = gradle_client(&state).await?;
+    let client = gradle_client(&app, &state).await?;
     let request_id = state.next_gradle_request_id("sync");
     state
         .begin_gradle(request_id.clone(), "project sync".to_owned(), "sync")
@@ -324,11 +325,12 @@ async fn gradle_sync(
 
 #[tauri::command]
 async fn gradle_run_task(
+    app: AppHandle,
     state: State<'_, AppState>,
     task: String,
     arguments: Option<Vec<String>>,
 ) -> Result<RunTaskResult, String> {
-    let client = gradle_client(&state).await?;
+    let client = gradle_client(&app, &state).await?;
     let request_id = state.next_gradle_request_id("task");
     state
         .begin_gradle(request_id.clone(), task.clone(), "task")
@@ -346,10 +348,11 @@ async fn gradle_run_task(
 
 #[tauri::command]
 async fn gradle_list_tests(
+    app: AppHandle,
     state: State<'_, AppState>,
     arguments: Option<Vec<String>>,
 ) -> Result<TestListing, String> {
-    let client = gradle_client(&state).await?;
+    let client = gradle_client(&app, &state).await?;
     let request_id = state.next_gradle_request_id("tests");
     state
         .begin_gradle(
@@ -375,11 +378,12 @@ async fn gradle_list_tests(
 
 #[tauri::command]
 async fn gradle_run_tests(
+    app: AppHandle,
     state: State<'_, AppState>,
     class_name: Option<String>,
     arguments: Option<Vec<String>>,
 ) -> Result<RunTestsResult, String> {
-    let client = gradle_client(&state).await?;
+    let client = gradle_client(&app, &state).await?;
     let label = class_name.clone().unwrap_or_else(|| "all tests".to_owned());
     let request_id = state.next_gradle_request_id("test");
     state
@@ -616,6 +620,143 @@ async fn java_organize_imports(
         .map_err(|error| format!("Organize imports failed: {error}"))
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrustView {
+    root: String,
+    trust: String,
+}
+
+#[tauri::command]
+fn workspace_trust(state: State<'_, AppState>) -> Result<TrustView, String> {
+    let root = workspace_root(&state)?;
+    Ok(TrustView {
+        root: path_text(&root),
+        trust: trust_label(&root),
+    })
+}
+
+#[tauri::command]
+async fn set_workspace_trust(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    trusted: bool,
+) -> Result<TrustView, String> {
+    let root = workspace_root(&state)?;
+    let mut store = ide_config::TrustStore::load(&ide_config::trust_path(&config_dir()))
+        .map_err(|error| error.to_string())?;
+    store
+        .set(&root, trusted)
+        .map_err(|error| error.to_string())?;
+    if !trusted {
+        stop_java(&app, &state).await;
+        stop_gradle(&state).await;
+        *state.opencode.lock().await = None;
+    }
+    Ok(TrustView {
+        root: path_text(&root),
+        trust: trust_label(&root),
+    })
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JavaSettingsView {
+    format_enabled: bool,
+    completion_enabled: bool,
+    completion_favorites: Vec<String>,
+    completion_import_order: Vec<String>,
+    completion_guess_method_arguments: bool,
+    vmargs: String,
+    origin: String,
+}
+
+#[tauri::command]
+fn java_settings(state: State<'_, AppState>) -> Result<JavaSettingsView, String> {
+    let root = workspace_root(&state)?;
+    let loaded =
+        ide_config::load_effective(&config_dir(), &root).map_err(|error| error.to_string())?;
+    Ok(settings_view(loaded))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveSettingsResult {
+    restart_required: bool,
+    reasons: Vec<String>,
+    origin: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JavaSettingsInput {
+    format_enabled: bool,
+    completion_enabled: bool,
+    completion_favorites: Vec<String>,
+    completion_import_order: Vec<String>,
+    completion_guess_method_arguments: bool,
+    vmargs: String,
+    scope: String,
+}
+
+#[tauri::command]
+async fn save_java_settings(
+    state: State<'_, AppState>,
+    settings: JavaSettingsInput,
+) -> Result<SaveSettingsResult, String> {
+    let root = workspace_root(&state)?;
+    let previous =
+        ide_config::load_effective(&config_dir(), &root).map_err(|error| error.to_string())?;
+    let incoming = ide_config::JavaSettings {
+        version: ide_config::SETTINGS_VERSION,
+        format_enabled: settings.format_enabled,
+        completion_enabled: settings.completion_enabled,
+        completion_favorites: settings.completion_favorites,
+        completion_import_order: settings.completion_import_order,
+        completion_guess_method_arguments: settings.completion_guess_method_arguments,
+        vmargs: settings.vmargs,
+    };
+    let path = match settings.scope.as_str() {
+        "workspace" => ide_config::workspace_settings_path(&root),
+        "user" => ide_config::user_settings_path(&config_dir()),
+        _ => return Err("scope must be \"user\" or \"workspace\"".to_owned()),
+    };
+    ide_config::save_settings_file(&path, &incoming).map_err(|error| error.to_string())?;
+    let effective =
+        ide_config::load_effective(&config_dir(), &root).map_err(|error| error.to_string())?;
+    let reasons: Vec<String> =
+        ide_config::requires_restart(&previous.settings, &effective.settings)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+    if let Some(client) = java_client_if_ready(&state).await {
+        client
+            .set_settings(effective.settings.to_language_server())
+            .await
+            .map_err(|error| format!("could not apply settings to jdtls: {error}"))?;
+    }
+    Ok(SaveSettingsResult {
+        restart_required: !reasons.is_empty(),
+        reasons,
+        origin: effective.origin.as_str().to_owned(),
+    })
+}
+
+#[tauri::command]
+fn java_debug_log(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let log = state
+        .debug_log
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(log.iter().cloned().collect())
+}
+
+#[tauri::command]
+fn java_clear_debug_log(state: State<'_, AppState>) -> Result<(), String> {
+    clear_debug_log(&state);
+    Ok(())
+}
+
 fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -697,6 +838,9 @@ fn discovery_status() -> JavaStatus {
 /// a machine without jdtls is a supported configuration, and the rest of the
 /// IDE keeps working.
 async fn start_java(app: &AppHandle, state: &AppState) -> JavaStatus {
+    if let Err(message) = ensure_trusted(state) {
+        return set_java_session(app, state, None, "restricted", message, None, None).await;
+    }
     {
         let mut session = state.java.lock().await;
         if session.client.is_some() || session.state == "starting" {
@@ -750,7 +894,37 @@ async fn start_java(app: &AppHandle, state: &AppState) -> JavaStatus {
             .await;
         }
     };
-    let config = JdtlsConfig::new(&java_home, installation, workspace_data_dir(&root), &root);
+    let loaded = match ide_config::load_effective(&config_dir(), &root) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            return java_failed(
+                app,
+                state,
+                format!("Java settings could not be read: {error}"),
+                installation_root,
+                java_home,
+            )
+            .await;
+        }
+    };
+    let vm_args = match ide_config::parse_vm_args(&loaded.settings.vmargs) {
+        Ok(args) => args,
+        Err(error) => {
+            return java_failed(
+                app,
+                state,
+                format!("Invalid java.jdt.ls.vmargs: {error}"),
+                installation_root,
+                java_home,
+            )
+            .await;
+        }
+    };
+    let language_settings = loaded.settings.to_language_server();
+    let mut config = JdtlsConfig::new(&java_home, installation, workspace_data_dir(&root), &root);
+    config.vm_args = vm_args;
+    config.settings = language_settings.clone();
+    clear_debug_log(state);
     set_java_session(
         app,
         state,
@@ -793,6 +967,16 @@ async fn start_java(app: &AppHandle, state: &AppState) -> JavaStatus {
             app,
             state,
             format!("jdtls setup failed: {error}"),
+            installation_root,
+            java_home,
+        )
+        .await;
+    }
+    if let Err(error) = client.set_settings(language_settings).await {
+        return java_failed(
+            app,
+            state,
+            format!("jdtls rejected settings: {error}"),
             installation_root,
             java_home,
         )
@@ -943,7 +1127,7 @@ fn spawn_java_events(app: AppHandle, mut events: broadcast::Receiver<JdtlsEvent>
                     if let Some(diagnostics) = diagnostics {
                         let data = serde_json::to_value(diagnostics).unwrap_or(Value::Null);
                         let _ = app.emit("java://diagnostics", data);
-                    } else if let Some((name, data)) = java_event_payload(&event) {
+                    } else if let Some((name, data)) = java_event_payload(&app, &event) {
                         let _ = app.emit("java://event", JavaEvent { name, data });
                     }
                     if terminal {
@@ -957,18 +1141,17 @@ fn spawn_java_events(app: AppHandle, mut events: broadcast::Receiver<JdtlsEvent>
     });
 }
 
-fn java_event_payload(event: &JdtlsEvent) -> Option<(String, Value)> {
+fn java_event_payload(app: &AppHandle, event: &JdtlsEvent) -> Option<(String, Value)> {
     match event {
         JdtlsEvent::Status { kind, message } => Some((
             "status-message".to_owned(),
             serde_json::json!({ "kind": kind, "message": message }),
         )),
-        JdtlsEvent::LogMessage { level, message } | JdtlsEvent::ShowMessage { level, message } => {
-            Some((
-                "log".to_owned(),
-                serde_json::json!({ "level": level, "message": message }),
-            ))
-        }
+        JdtlsEvent::LogMessage { level, message } => route_server_log(app, *level, message),
+        JdtlsEvent::ShowMessage { level, message } => Some((
+            "log".to_owned(),
+            serde_json::json!({ "level": level, "message": message }),
+        )),
         JdtlsEvent::Progress { token, value } => Some((
             "progress".to_owned(),
             serde_json::json!({ "token": token, "value": value }),
@@ -1023,23 +1206,7 @@ fn discover_jdtls_root() -> Option<PathBuf> {
 }
 
 fn find_jdtls_java_home() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    for variable in ["JAVAIDE_JDTLS_JAVA_HOME", "JAVA_HOME"] {
-        if let Some(home) = std::env::var_os(variable) {
-            candidates.push(PathBuf::from(home));
-        }
-    }
-    candidates.push(PathBuf::from("/usr/lib/jvm/temurin-21"));
-    candidates.push(PathBuf::from("/usr/lib/jvm/temurin-25"));
-    candidates.push(PathBuf::from("/opt/java/temurin-21"));
-    candidates.extend(version_directories(&app_data_dir().join("runtimes")));
-    candidates
-        .into_iter()
-        .find(|home| {
-            home.join("bin").join("java").is_file()
-                && java_major(home).is_some_and(|major| major >= 21)
-        })
-        .map(|home| home.canonicalize().unwrap_or(home))
+    find_jdk(21)
 }
 
 fn version_directories(root: &Path) -> Vec<PathBuf> {
@@ -1084,6 +1251,7 @@ async fn opencode_connect(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ServerSummary, String> {
+    ensure_trusted(&state)?;
     if let Some(client) = state.opencode.lock().await.clone() {
         return Ok(summary(&client));
     }
@@ -1141,6 +1309,7 @@ async fn opencode_sessions(state: State<'_, AppState>) -> Result<Vec<SessionSumm
 
 #[tauri::command]
 async fn opencode_create_session(state: State<'_, AppState>) -> Result<SessionSummary, String> {
+    ensure_trusted(&state)?;
     let client = state.opencode.lock().await.clone();
     let client = client.ok_or_else(|| "OpenCode is not connected".to_owned())?;
     let root = state
@@ -1177,6 +1346,7 @@ async fn opencode_prompt(
     session_id: String,
     text: String,
 ) -> Result<(), String> {
+    ensure_trusted(&state)?;
     let client = state.opencode.lock().await.clone();
     let client = client.ok_or_else(|| "OpenCode is not connected".to_owned())?;
     client
@@ -1207,7 +1377,7 @@ fn summary(client: &OpenCodeClient) -> ServerSummary {
     }
 }
 
-async fn ensure_gradle(state: &AppState) -> Result<(), String> {
+async fn ensure_gradle(app: &AppHandle, state: &AppState) -> Result<(), String> {
     let mut guard = state.gradle.lock().await;
     let root = state
         .workspace
@@ -1232,6 +1402,24 @@ async fn ensure_gradle(state: &AppState) -> Result<(), String> {
     })
     .await
     .map_err(|error| format!("cannot start the Gradle bridge: {error}"))?;
+    let mut events = client.subscribe();
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(GradleEvent::TaskOutput { stream, text, .. })
+                | Ok(GradleEvent::TestOutput { stream, text, .. }) => {
+                    let _ = handle.emit(
+                        "gradle://output",
+                        serde_json::json!({ "stream": stream, "text": text }),
+                    );
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+                Ok(_) => {}
+            }
+        }
+    });
     *guard = Some(Arc::new(client));
     Ok(())
 }
@@ -1240,12 +1428,29 @@ async fn ensure_gradle(state: &AppState) -> Result<(), String> {
 ///
 /// The handle is cloned out of the state mutex so long-running builds never
 /// hold the mutex; otherwise the Stop command could not reach the client.
-async fn gradle_client(state: &AppState) -> Result<Arc<GradleClient>, String> {
-    ensure_gradle(state).await?;
+/// Gradle is refused until the workspace is trusted.
+async fn gradle_client(app: &AppHandle, state: &AppState) -> Result<Arc<GradleClient>, String> {
+    ensure_trusted(state)?;
+    ensure_gradle(app, state).await?;
     let guard = state.gradle.lock().await;
     guard
         .clone()
         .ok_or_else(|| "Gradle is not connected".to_owned())
+}
+
+/// Cancels the active Gradle operation, if any, and stops the bridge.
+async fn stop_gradle(state: &AppState) {
+    let active = state.gradle_active.lock().await.clone();
+    let previous = state.gradle.lock().await.take();
+    if let Some(active) = active {
+        if let Some(client) = previous.as_ref() {
+            let _ = client.cancel(&active.request_id).await;
+        }
+        *state.gradle_active.lock().await = None;
+    }
+    if let Some(client) = previous {
+        let _ = client.shutdown().await;
+    }
 }
 
 /// Normalizes user-supplied Gradle arguments.
@@ -1322,23 +1527,64 @@ fn find_bridge() -> Result<PathBuf, String> {
 }
 
 fn find_java_home() -> Result<PathBuf, String> {
+    find_jdk(17).ok_or_else(|| "no Java 17+ JDK found; set JAVA_HOME".to_owned())
+}
+
+/// Environment variables, well-known install roots, and a scan of JDK directories.
+fn jdk_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(home) = std::env::var_os("JAVA_HOME") {
-        candidates.push(PathBuf::from(home));
+    for variable in ["JAVAIDE_JDTLS_JAVA_HOME", "JAVA_HOME"] {
+        if let Some(home) = std::env::var_os(variable) {
+            candidates.push(PathBuf::from(home));
+        }
     }
     candidates.push(PathBuf::from("/usr/lib/jvm/temurin-21"));
     candidates.push(PathBuf::from("/usr/lib/jvm/temurin-25"));
     candidates.push(PathBuf::from("/opt/java/temurin-21"));
-    for candidate in candidates {
-        if candidate.join("bin").join("java").is_file()
-            && java_major(&candidate).is_some_and(|major| major >= 17)
-        {
-            return candidate
-                .canonicalize()
-                .map_err(|error| format!("cannot resolve JAVA_HOME: {error}"));
+    candidates.extend(version_directories(&app_data_dir().join("runtimes")));
+    candidates.extend(scan_jdk_homes(&[
+        PathBuf::from("/usr/lib/jvm"),
+        PathBuf::from("/usr/lib/jvm/default-java"),
+        PathBuf::from("/Library/Java/JavaVirtualMachines"),
+    ]));
+    candidates
+}
+
+fn scan_jdk_homes(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for root in roots {
+        if root.join("bin").join("java").is_file() {
+            found.push(root.clone());
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let home = path.join("Contents").join("Home");
+            if home.join("bin").join("java").is_file() {
+                found.push(home);
+            } else if path.join("bin").join("java").is_file() {
+                found.push(path);
+            }
         }
     }
-    Err("no Java 17+ JDK found; set JAVA_HOME".to_owned())
+    found.sort();
+    found.reverse();
+    found
+}
+
+fn find_jdk(minimum_major: u32) -> Option<PathBuf> {
+    jdk_candidates().into_iter().find_map(|home| {
+        if home.join("bin").join("java").is_file()
+            && java_major(&home).is_some_and(|major| major >= minimum_major)
+        {
+            Some(home.canonicalize().unwrap_or(home))
+        } else {
+            None
+        }
+    })
 }
 
 fn java_major(home: &Path) -> Option<u32> {
@@ -1408,6 +1654,108 @@ fn is_skipped(name: &str) -> bool {
     )
 }
 
+fn config_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("JAVAIDE_CONFIG_DIR") {
+        let path = PathBuf::from(path);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
+    ide_platform::config_home()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("javaide")
+}
+
+fn trust_label(root: &Path) -> String {
+    ide_config::TrustStore::load(&ide_config::trust_path(&config_dir()))
+        .map(|store| store.decision(root).as_str().to_owned())
+        .unwrap_or_else(|_| "unknown".to_owned())
+}
+
+fn ensure_trusted(state: &AppState) -> Result<(), String> {
+    let root = workspace_root(state)?;
+    let store = ide_config::TrustStore::load(&ide_config::trust_path(&config_dir()))
+        .map_err(|error| error.to_string())?;
+    match store.decision(&root) {
+        ide_config::TrustDecision::Trusted => Ok(()),
+        ide_config::TrustDecision::Restricted => Err(
+            "This folder is restricted. Trust it before using Java language features, Gradle, or OpenCode.".to_owned(),
+        ),
+        ide_config::TrustDecision::Unknown => Err(
+            "This folder is not trusted yet. Trust it before using Java language features, Gradle, or OpenCode.".to_owned(),
+        ),
+    }
+}
+
+fn settings_view(loaded: ide_config::EffectiveSettings) -> JavaSettingsView {
+    let settings = loaded.settings;
+    JavaSettingsView {
+        format_enabled: settings.format_enabled,
+        completion_enabled: settings.completion_enabled,
+        completion_favorites: settings.completion_favorites,
+        completion_import_order: settings.completion_import_order,
+        completion_guess_method_arguments: settings.completion_guess_method_arguments,
+        vmargs: settings.vmargs,
+        origin: loaded.origin.as_str().to_owned(),
+    }
+}
+
+/// LSP `MessageType`: 1 error, 2 warning, 3 info, 4 log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerLogRoute {
+    Panel,
+    DebugBuffer,
+}
+
+fn server_log_route(level: i32) -> ServerLogRoute {
+    if level >= 4 {
+        ServerLogRoute::DebugBuffer
+    } else {
+        ServerLogRoute::Panel
+    }
+}
+
+fn route_server_log(app: &AppHandle, level: i32, message: &str) -> Option<(String, Value)> {
+    if server_log_route(level) == ServerLogRoute::DebugBuffer {
+        push_debug_log(&app.state::<AppState>(), message);
+        None
+    } else {
+        Some((
+            "log".to_owned(),
+            serde_json::json!({ "level": level, "message": message }),
+        ))
+    }
+}
+
+fn push_debug_log(state: &AppState, message: &str) {
+    let mut log = state
+        .debug_log
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if log.len() == DEBUG_LOG_CAPACITY {
+        log.pop_front();
+    }
+    log.push_back(truncate_log_line(message));
+}
+
+fn clear_debug_log(state: &AppState) {
+    let mut log = state
+        .debug_log
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    log.clear();
+}
+
+fn truncate_log_line(message: &str) -> String {
+    const LIMIT: usize = 2_000;
+    if message.chars().count() <= LIMIT {
+        return message.to_owned();
+    }
+    let mut truncated: String = message.chars().take(LIMIT).collect();
+    truncated.push('…');
+    truncated
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1435,6 +1783,12 @@ pub fn run() {
             java_definition,
             java_format_document,
             java_organize_imports,
+            java_settings,
+            save_java_settings,
+            java_debug_log,
+            java_clear_debug_log,
+            workspace_trust,
+            set_workspace_trust,
             opencode_connect,
             opencode_sessions,
             opencode_create_session,
@@ -1481,5 +1835,47 @@ mod tests {
         .expect("operation");
         assert_eq!(value["requestId"], "task-7");
         assert_eq!(value["kind"], "task");
+    }
+
+    #[test]
+    fn debug_log_messages_stay_out_of_the_panel() {
+        assert_eq!(server_log_route(1), ServerLogRoute::Panel);
+        assert_eq!(server_log_route(2), ServerLogRoute::Panel);
+        assert_eq!(server_log_route(3), ServerLogRoute::Panel);
+        assert_eq!(server_log_route(4), ServerLogRoute::DebugBuffer);
+    }
+
+    #[test]
+    fn debug_log_ring_drops_the_oldest_line() {
+        let state = AppState::new();
+        for index in 0..(DEBUG_LOG_CAPACITY + 3) {
+            push_debug_log(&state, &format!("line {index}"));
+        }
+        let log = state.debug_log.lock().expect("log");
+        assert_eq!(log.len(), DEBUG_LOG_CAPACITY);
+        let newest = format!("line {}", DEBUG_LOG_CAPACITY + 2);
+        assert_eq!(log.front().map(String::as_str), Some("line 3"));
+        assert_eq!(log.back().map(String::as_str), Some(newest.as_str()));
+    }
+
+    #[test]
+    fn jdk_scan_finds_a_home_with_a_java_binary() {
+        let root = std::env::temp_dir().join(format!("javaide-jdk-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("jdk-21");
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        std::fs::write(home.join("bin").join("java"), b"").unwrap();
+        let found = scan_jdk_homes(&[root.clone()]);
+        assert_eq!(found, vec![home]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn log_lines_truncate_on_char_boundaries() {
+        assert_eq!(truncate_log_line("ok"), "ok");
+        let long = "ä".repeat(2_001);
+        let truncated = truncate_log_line(&long);
+        assert!(truncated.ends_with('…'));
+        assert!(truncated.chars().count() <= 2_001);
     }
 }

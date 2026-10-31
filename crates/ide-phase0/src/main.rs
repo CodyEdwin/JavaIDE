@@ -439,7 +439,7 @@ async fn run_gradle(args: GradleArgs) -> Result<()> {
     };
     println!("gradle root: {}", root.display());
 
-    let mut client = GradleClient::start(GradleOptions {
+    let client = GradleClient::start(GradleOptions {
         bridge,
         root: root.clone(),
         java_home: Some(java_home),

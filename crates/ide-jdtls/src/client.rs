@@ -22,7 +22,7 @@ use lsp_types::{
     WorkDoneProgressParams, WorkspaceEdit,
 };
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::ChildStderr;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -253,7 +253,7 @@ impl JdtlsClient {
         let (ready_sender, ready) = watch::channel(false);
         let (exit_sender, exit) = watch::channel(None);
         let (kill_sender, kill_receiver) = oneshot::channel();
-        let settings = Arc::new(RwLock::new(Value::Object(Map::new())));
+        let settings = Arc::new(RwLock::new(config.settings.clone()));
         let diagnostics = Arc::new(Mutex::new(HashMap::new()));
 
         spawn_process_monitor(child, kill_receiver, exit_sender, events.clone());
