@@ -57,6 +57,9 @@ const state = {
   gradle: null,
   gradleActive: null,
   gradleSettings: loadGradleSettings(),
+  trust: "unknown",
+  split: false,
+  gradleSawOutput: false,
   java: {
     status: "stopped",
     message: "",
@@ -68,6 +71,8 @@ const state = {
     queue: Promise.resolve(),
     problemFilter: loadProblemFilter(),
     collapsedProblems: new Set(),
+    completionEnabled: true,
+    formatEnabled: true,
   },
   ai: {
     connected: false,
@@ -78,7 +83,15 @@ const state = {
   },
 };
 
-let editor = null;
+const panes = {
+  primary: { view: null, path: null },
+  secondary: { view: null, path: null },
+};
+let focusedPane = "primary";
+let mirroring = false;
+let paletteMode = "command";
+let paletteIndex = 0;
+let paletteSymbols = [];
 let busyCount = 0;
 let busyLabel = "";
 
@@ -144,7 +157,11 @@ function languageFor(path) {
   return [];
 }
 
-function editorExtensions(path) {
+function activeView() {
+  return panes[focusedPane].view;
+}
+
+function editorExtensions(path, pane) {
   return [
     basicSetup,
     oneDark,
@@ -185,10 +202,49 @@ function editorExtensions(path) {
           return true;
         },
       },
+      {
+        key: "F2",
+        preventDefault: true,
+        run: () => {
+          startRename();
+          return true;
+        },
+      },
+      {
+        key: "Shift-F12",
+        preventDefault: true,
+        run: () => {
+          findReferences();
+          return true;
+        },
+      },
+      {
+        key: "Mod-.",
+        preventDefault: true,
+        run: () => {
+          showCodeActions();
+          return true;
+        },
+      },
+      {
+        key: "(",
+        run: () => {
+          scheduleSignatureHelp();
+          return false;
+        },
+      },
+      {
+        key: ",",
+        run: () => {
+          scheduleSignatureHelp();
+          return false;
+        },
+      },
     ]),
     EditorView.updateListener.of((update) => {
-      if (!update.docChanged || !state.active) return;
-      const doc = state.docs.get(state.active);
+      if (mirroring || !update.docChanged) return;
+      const current = panes[pane].path;
+      const doc = current ? state.docs.get(current) : null;
       if (!doc) return;
       doc.content = update.state.doc.toString();
       if (!doc.dirty) {
@@ -196,36 +252,91 @@ function editorExtensions(path) {
         renderTabs();
       }
       updateStatusRight();
-      javaScheduleChange(state.active);
+      mirrorPane(pane, current, doc.content);
+      javaScheduleChange(current);
+    }),
+    EditorView.domEventHandlers({
+      mousedown: () => focusPane(pane),
     }),
   ];
 }
 
 function createEditor() {
-  editor = new EditorView({
+  panes.primary.view = new EditorView({
     state: EditorState.create({ doc: "" }),
     parent: $("editor"),
   });
 }
 
-function showActiveDocument() {
-  const doc = state.active ? state.docs.get(state.active) : null;
-  if (!doc) {
-    $("welcome").classList.remove("hidden");
-    $("editor").classList.add("hidden");
-    editor.setState(EditorState.create({ doc: "" }));
-    updateStatusRight();
-    return;
-  }
-  $("welcome").classList.add("hidden");
-  $("editor").classList.remove("hidden");
-  editor.setState(
-    EditorState.create({ doc: doc.content, extensions: editorExtensions(doc.path) }),
-  );
-  // `setState` drops decorations, so re-apply the cached publications for the
-  // document that just became visible.
-  applyJavaDiagnostics(doc.path);
+function focusPane(pane) {
+  if (!state.split && pane === "secondary") return;
+  focusedPane = pane;
+  state.active = panes[pane].path;
+  updatePaneChrome();
+  renderTabs();
   updateStatusRight();
+}
+
+function updatePaneChrome() {
+  $("editor").classList.toggle("focused", state.split && focusedPane === "primary");
+  $("editor-secondary").classList.toggle("focused", state.split && focusedPane === "secondary");
+}
+
+function updateWelcome() {
+  const visible = Boolean(panes.primary.path) || (state.split && Boolean(panes.secondary.path));
+  $("welcome").classList.toggle("hidden", visible);
+  $("editor-split").classList.toggle("hidden", !visible);
+}
+
+function showPane(pane, path) {
+  const view = panes[pane].view;
+  if (!view) return;
+  panes[pane].path = path || null;
+  if (pane === focusedPane) state.active = panes[pane].path;
+  const doc = path ? state.docs.get(path) : null;
+  if (!doc) {
+    view.setState(EditorState.create({ doc: "" }));
+  } else {
+    view.setState(
+      EditorState.create({ doc: doc.content, extensions: editorExtensions(doc.path, pane) }),
+    );
+    applyJavaDiagnostics(path);
+  }
+  updateWelcome();
+  updatePaneChrome();
+  updateStatusRight();
+}
+
+function showActiveDocument() {
+  showPane(focusedPane, state.active);
+}
+
+function toggleSplit() {
+  state.split = !state.split;
+  $("editor-secondary").classList.toggle("hidden", !state.split);
+  if (state.split && !panes.secondary.view) {
+    panes.secondary.view = new EditorView({
+      state: EditorState.create({ doc: "" }),
+      parent: $("editor-secondary"),
+    });
+  }
+  if (state.split && !panes.secondary.path && panes.primary.path) {
+    showPane("secondary", panes.primary.path);
+  }
+  if (!state.split && focusedPane === "secondary") focusPane("primary");
+  updateWelcome();
+  updatePaneChrome();
+  setStatus(state.split ? "Editor split" : "Editor split closed");
+}
+
+function mirrorPane(from, path, text) {
+  const other = from === "primary" ? "secondary" : "primary";
+  if (!state.split || panes[other].path !== path) return;
+  const view = panes[other].view;
+  if (!view || view.state.doc.toString() === text) return;
+  mirroring = true;
+  view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text } });
+  mirroring = false;
 }
 
 async function openFile(entry) {
@@ -259,11 +370,18 @@ function closeFile(path, event) {
   if (doc?.dirty && !confirm(`${doc.name} has unsaved changes. Close it?`)) return;
   state.docs.delete(path);
   javaDocumentClosed(path);
-  if (state.active === path) {
-    state.active = [...state.docs.keys()].pop() || null;
+  const fallback = [...state.docs.keys()].pop() || null;
+  for (const pane of ["primary", "secondary"]) {
+    if (panes[pane].path !== path) continue;
+    const next = pane === focusedPane ? fallback : null;
+    if (pane === focusedPane) state.active = next;
+    showPane(pane, next);
+  }
+  if (![panes.primary.path, panes.secondary.path].includes(state.active)) {
+    state.active = panes[focusedPane].path;
   }
   renderTabs();
-  showActiveDocument();
+  renderTree();
 }
 
 function renderTabs() {
@@ -345,6 +463,9 @@ async function openWorkspace(path) {
     );
     state.docs.clear();
     state.active = null;
+    panes.primary.path = null;
+    panes.secondary.path = null;
+    state.trust = view.trust || "unknown";
     state.gradle = null;
     setGradleActive(null);
     for (const timer of state.java.changeTimers.values()) clearTimeout(timer);
@@ -364,6 +485,7 @@ async function openWorkspace(path) {
     showActiveDocument();
     renderGradle();
     renderJava();
+    renderTrust();
     setStatus(`Workspace: ${view.root}`);
     updateStatusRight();
     javaRefreshStatus();
@@ -499,10 +621,16 @@ function setGradleActive(active) {
 }
 
 async function withGradle(label, kind, body) {
+  if (!workspaceTrusted()) {
+    setStatus("Trust this folder before running Gradle");
+    renderTrust();
+    return;
+  }
   if (state.gradleActive) {
     setStatus("Gradle is already running");
     return;
   }
+  state.gradleSawOutput = false;
   setGradleActive({ label, kind });
   setBusy(label);
   try {
@@ -595,8 +723,8 @@ async function runGradleTask(task) {
       for (const outcome of result.taskOutcomes) {
         appendGradleLog(`  ${outcome.outcome.padEnd(12)} ${outcome.taskPath}`);
       }
-      if (result.stdout) appendGradleLog(result.stdout.trimEnd());
-      if (result.stderr) appendGradleLog(result.stderr.trimEnd());
+      if (!state.gradleSawOutput && result.stdout) appendGradleLog(result.stdout.trimEnd());
+      if (!state.gradleSawOutput && result.stderr) appendGradleLog(result.stderr.trimEnd());
       for (const failure of result.failures) appendGradleLog(`FAILURE: ${failure}`);
       if (result.cancelled) {
         appendGradleLog(`  CANCELLED after ${result.durationMs} ms`);
@@ -723,6 +851,7 @@ const JAVA_LABELS = {
   ready: "ready",
   failed: "failed",
   unavailable: "not available",
+  restricted: "restricted",
 };
 
 function isJavaPath(path) {
@@ -787,7 +916,12 @@ function queueJava(task) {
   return state.java.queue;
 }
 
+function workspaceTrusted() {
+  return state.trust === "trusted";
+}
+
 function javaDocumentOpened(path, text) {
+  if (!workspaceTrusted()) return;
   if (!isJavaPath(path) || !state.docs.has(path)) return;
   if (state.java.opened.has(path)) return;
   state.java.opened.add(path);
@@ -875,20 +1009,24 @@ function offsetAt(doc, position) {
 }
 
 function applyJavaDiagnostics(path) {
-  if (!editor || state.active !== path) return;
-  const doc = editor.state.doc;
-  const diagnostics = (state.java.diagnostics.get(path) || []).map((diagnostic) => {
-    const from = offsetAt(doc, diagnostic.range?.start);
-    const to = offsetAt(doc, diagnostic.range?.end);
-    return {
-      from: Math.min(from, to),
-      to: Math.max(from, to),
-      severity: diagnostic.severity || "info",
-      message: diagnostic.message || "Java diagnostic",
-      source: diagnostic.source || "jdtls",
-    };
-  });
-  editor.dispatch(setDiagnostics(editor.state, diagnostics));
+  for (const pane of ["primary", "secondary"]) {
+    const view = panes[pane].view;
+    if (!view || panes[pane].path !== path) continue;
+    if (pane === "secondary" && !state.split) continue;
+    const doc = view.state.doc;
+    const diagnostics = (state.java.diagnostics.get(path) || []).map((diagnostic) => {
+      const from = offsetAt(doc, diagnostic.range?.start);
+      const to = offsetAt(doc, diagnostic.range?.end);
+      return {
+        from: Math.min(from, to),
+        to: Math.max(from, to),
+        severity: diagnostic.severity || "info",
+        message: diagnostic.message || "Java diagnostic",
+        source: diagnostic.source || "jdtls",
+      };
+    });
+    view.dispatch(setDiagnostics(view.state, diagnostics));
+  }
 }
 
 function handleJavaDiagnostics(payload) {
@@ -1103,7 +1241,10 @@ function renderProblems() {
 function clearJavaProblems() {
   state.java.diagnostics.clear();
   state.java.collapsedProblems.clear();
-  if (editor) editor.dispatch(setDiagnostics(editor.state, []));
+  for (const pane of ["primary", "secondary"]) {
+    const view = panes[pane].view;
+    if (view) view.dispatch(setDiagnostics(view.state, []));
+  }
   renderProblems();
   updateStatusRight();
 }
@@ -1149,7 +1290,7 @@ function completionApply(item) {
 
 async function javaCompletionSource(context) {
   const path = state.active;
-  if (!isJavaPath(path) || !javaReady()) return null;
+  if (!state.java.completionEnabled || !isJavaPath(path) || !javaReady()) return null;
   const line = context.state.doc.lineAt(context.pos);
   try {
     const items = await invoke("java_completion", {
@@ -1175,6 +1316,7 @@ async function javaCompletionSource(context) {
 }
 
 async function jumpToDefinition() {
+  const editor = activeView();
   const path = state.active;
   if (!editor || !isJavaPath(path)) return;
   if (!javaReady()) {
@@ -1228,6 +1370,7 @@ async function openAbsoluteFile(path, line = 0, character = 0) {
 }
 
 function revealLine(line, character) {
+  const editor = activeView();
   if (!editor) return;
   const at = offsetAt(editor.state.doc, { line, character });
   editor.dispatch({ selection: { anchor: at }, scrollIntoView: true });
@@ -1235,6 +1378,7 @@ function revealLine(line, character) {
 }
 
 function applyJavaEdits(edits) {
+  const editor = activeView();
   if (!editor || !Array.isArray(edits) || !edits.length) return 0;
   const doc = editor.state.doc;
   // CodeMirror applies every change against the original document, so the
@@ -1253,8 +1397,13 @@ function applyJavaEdits(edits) {
 }
 
 async function formatJavaDocument() {
+  const editor = activeView();
   const path = state.active;
   if (!editor || !isJavaPath(path)) return;
+  if (!state.java.formatEnabled) {
+    setStatus("Java formatting is disabled in settings");
+    return;
+  }
   if (!javaReady()) {
     setStatus("Java language server is not ready");
     return;
@@ -1276,6 +1425,7 @@ async function formatJavaDocument() {
 }
 
 async function organizeJavaImports() {
+  const editor = activeView();
   const path = state.active;
   if (!editor || !isJavaPath(path)) return;
   if (!javaReady()) {
@@ -1519,6 +1669,599 @@ async function aiStop() {
   }
 }
 
+function showPanel(name) {
+  for (const button of document.querySelectorAll(".activity-button")) {
+    button.classList.toggle("active", button.dataset.panel === name);
+  }
+  for (const panel of document.querySelectorAll(".panel")) panel.classList.add("hidden");
+  $(`panel-${name}`).classList.remove("hidden");
+}
+
+function taskFor(name, predicate) {
+  const projects = state.gradle?.projects || [];
+  const root = projects.find((project) => project.path === ":") || projects[0];
+  const pools = root ? [root, ...projects.filter((project) => project !== root)] : projects;
+  for (const project of pools) {
+    const match = project.tasks.find((task) =>
+      predicate ? predicate(task) : task.name === name,
+    );
+    if (match) return match;
+  }
+  return { path: name, name };
+}
+
+async function runNamedTask(name, predicate) {
+  showPanel("gradle");
+  await runGradleTask(taskFor(name, predicate));
+}
+
+function renderTrust() {
+  const banner = $("trust-banner");
+  if (!banner) return;
+  if (state.trust === "trusted") {
+    banner.classList.add("hidden");
+    banner.replaceChildren();
+    return;
+  }
+  banner.classList.remove("hidden");
+  banner.replaceChildren();
+  const text = document.createElement("span");
+  text.textContent = state.trust === "restricted"
+    ? "Restricted mode. Editing works, but Java intelligence, Gradle, and OpenCode stay off until you trust this folder."
+    : "This folder is not trusted. Java language features and Gradle can execute project code.";
+  const trust = document.createElement("button");
+  trust.type = "button";
+  trust.textContent = "Trust folder";
+  trust.addEventListener("click", () => setTrust(true));
+  banner.append(text, trust);
+  if (state.trust !== "restricted") {
+    const restrict = document.createElement("button");
+    restrict.type = "button";
+    restrict.textContent = "Don't trust";
+    restrict.addEventListener("click", () => setTrust(false));
+    banner.appendChild(restrict);
+  }
+}
+
+async function setTrust(trusted) {
+  try {
+    const view = await call("set_workspace_trust", { trusted });
+    state.trust = view.trust;
+    renderTrust();
+    setStatus(trusted ? "Workspace trusted" : "Workspace restricted");
+    if (trusted) {
+      for (const path of state.docs.keys()) javaDocumentOpened(path);
+    } else {
+      state.java.status = "restricted";
+      state.java.message = "This folder is restricted.";
+      renderJava();
+    }
+  } catch (error) {
+    showError(String(error));
+  }
+}
+
+function linesOf(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim());
+}
+
+async function loadJavaSettings() {
+  try {
+    const settings = await call("java_settings");
+    state.java.formatEnabled = settings.formatEnabled !== false;
+    state.java.completionEnabled = settings.completionEnabled !== false;
+    $("java-format-enabled").checked = state.java.formatEnabled;
+    $("java-completion-enabled").checked = state.java.completionEnabled;
+    $("java-guess-arguments").checked = settings.completionGuessMethodArguments !== false;
+    $("java-favorites").value = (settings.completionFavorites || []).join("\n");
+    $("java-import-order").value = (settings.completionImportOrder || []).join("\n");
+    $("java-vmargs").value = settings.vmargs || "";
+    $("java-settings-scope").value = settings.origin === "workspace" ? "workspace" : "user";
+    $("java-settings-note").textContent = settings.origin === "default"
+      ? "Using built-in defaults. VM arguments apply the next time jdtls starts."
+      : `Loaded ${settings.origin} settings. VM arguments apply the next time jdtls starts.`;
+  } catch (error) {
+    $("java-settings-note").textContent = String(error);
+  }
+}
+
+async function saveJavaSettings() {
+  const scope = $("java-settings-scope").value === "workspace" ? "workspace" : "user";
+  try {
+    const result = await call("save_java_settings", {
+      settings: {
+        formatEnabled: $("java-format-enabled").checked,
+        completionEnabled: $("java-completion-enabled").checked,
+        completionGuessMethodArguments: $("java-guess-arguments").checked,
+        completionFavorites: linesOf($("java-favorites").value).filter(Boolean),
+        completionImportOrder: linesOf($("java-import-order").value),
+        vmargs: $("java-vmargs").value.trim(),
+        scope,
+      },
+    });
+    state.java.formatEnabled = $("java-format-enabled").checked;
+    state.java.completionEnabled = $("java-completion-enabled").checked;
+    const restart = result.restartRequired
+      ? ` Restart jdtls to apply ${result.reasons.join(", ")}.`
+      : "";
+    $("java-settings-note").textContent = `Saved ${result.origin} settings.${restart}`;
+    setStatus(result.restartRequired ? "Settings saved; restart jdtls to apply VM arguments" : "Java settings saved");
+  } catch (error) {
+    showError(String(error));
+    $("java-settings-note").textContent = String(error);
+  }
+}
+
+async function showDebugLog() {
+  const view = $("java-debug-log");
+  view.classList.remove("hidden");
+  try {
+    const lines = await call("java_debug_log");
+    view.textContent = lines.length ? lines.join("\n") : "No debug output buffered.";
+    view.scrollTop = view.scrollHeight;
+  } catch (error) {
+    view.textContent = String(error);
+  }
+}
+
+const COMMANDS = [
+  { title: "File: Open Folder", hint: "folder", run: openFolder },
+  { title: "Go to File", hint: "Ctrl+P", run: () => openPalette("file") },
+  { title: "File: Save", hint: "Ctrl+S", run: () => saveActive() },
+  { title: "Java: Format Document", hint: "Shift+Alt+F", run: () => formatJavaDocument() },
+  { title: "Java: Organize Imports", hint: "Shift+Alt+O", run: () => organizeJavaImports() },
+  { title: "Java: Go to Definition", hint: "F12", run: () => jumpToDefinition() },
+  { title: "Java: Find References", hint: "Shift+F12", run: () => findReferences() },
+  { title: "Java: Rename Symbol", hint: "F2", run: () => startRename() },
+  { title: "Java: Quick Fix", hint: "Ctrl+.", run: () => showCodeActions() },
+  { title: "Java: Go to Symbol", hint: "outline", run: () => goToDocumentSymbol() },
+  { title: "Java: Go to Implementation", hint: "", run: () => jumpLike("java_implementation", "implementation") },
+  { title: "Java: Go to Type Definition", hint: "", run: () => jumpLike("java_type_definition", "type definition") },
+  { title: "View: Split Editor", hint: "", run: () => toggleSplit() },
+  { title: "Gradle: Compile", hint: "compileJava", run: () => runNamedTask("compileJava") },
+  { title: "Gradle: Run Application", hint: "run", run: () => runNamedTask("run", (task) => task.isRun && task.name === "run") },
+  { title: "Gradle: Run Tests", hint: "test", run: () => runNamedTask("test", (task) => task.isTest && task.name === "test") },
+  { title: "Gradle: Sync Project", hint: "", run: () => gradleSync() },
+  { title: "Java: Start or Restart Language Server", hint: "", run: () => javaToggleServer() },
+  { title: "Java: Show Debug Log", hint: "", run: () => { showPanel("java"); showDebugLog(); } },
+  { title: "Workspace: Trust This Folder", hint: "", run: () => setTrust(true) },
+  { title: "Workspace: Restrict This Folder", hint: "", run: () => setTrust(false) },
+  { title: "View: Explorer", hint: "", run: () => showPanel("files") },
+  { title: "View: Java", hint: "", run: () => showPanel("java") },
+  { title: "View: Gradle", hint: "", run: () => showPanel("gradle") },
+  { title: "View: OpenCode", hint: "", run: () => showPanel("ai") },
+];
+
+function cursorPosition() {
+  const view = activeView();
+  if (!view) return null;
+  const pos = view.state.selection.main.head;
+  const line = view.state.doc.lineAt(pos);
+  return {
+    view,
+    path: state.active,
+    line: line.number - 1,
+    character: pos - line.from,
+    from: view.state.selection.main.from,
+    to: view.state.selection.main.to,
+    anchorLine: view.state.doc.lineAt(view.state.selection.main.from),
+  };
+}
+
+function scheduleSignatureHelp() {
+  setTimeout(() => {
+    showSignatureHelp().catch(() => {});
+  }, 40);
+}
+
+async function showSignatureHelp() {
+  const cursor = cursorPosition();
+  const box = $("signature-help");
+  if (!cursor || !isJavaPath(cursor.path) || !javaReady() || !workspaceTrusted()) {
+    box.classList.add("hidden");
+    return;
+  }
+  const signatures = await invoke("java_signature_help", {
+    path: cursor.path,
+    line: cursor.line,
+    character: cursor.character,
+  });
+  if (!Array.isArray(signatures) || !signatures.length) {
+    box.classList.add("hidden");
+    return;
+  }
+  box.replaceChildren();
+  for (const signature of signatures.slice(0, 4)) {
+    const row = document.createElement("div");
+    if (signature.active) row.append(document.createTextNode(signature.label));
+    else row.textContent = signature.label;
+    if (signature.active && signature.parameters?.length) {
+      row.textContent = "";
+      const active = signature.parameters.find((parameter) => parameter.active);
+      row.textContent = signature.label;
+      if (active) row.title = active.label;
+    }
+    box.appendChild(row);
+  }
+  const active = signatures.find((signature) => signature.active) || signatures[0];
+  const parameter = active.parameters?.find((item) => item.active);
+  if (parameter) {
+    const note = document.createElement("div");
+    note.className = "active-param";
+    note.textContent = parameter.label;
+    box.appendChild(note);
+  }
+  const coords = cursor.view.coordsAtPos(cursor.view.state.selection.main.head);
+  if (coords) {
+    box.style.left = `${Math.max(8, coords.left)}px`;
+    box.style.top = `${coords.bottom + 6}px`;
+  }
+  box.classList.remove("hidden");
+}
+
+async function findReferences() {
+  const cursor = cursorPosition();
+  if (!cursor || !isJavaPath(cursor.path)) return;
+  if (!javaReady()) {
+    setStatus("Java language server is not ready");
+    return;
+  }
+  showPanel("java");
+  const container = $("java-references");
+  container.textContent = "Searching…";
+  try {
+    const locations = await invoke("java_references", {
+      path: cursor.path,
+      line: cursor.line,
+      character: cursor.character,
+    });
+    renderLocations(container, locations, "No references");
+    setStatus(`${locations.length} reference(s)`);
+  } catch (error) {
+    container.textContent = String(error);
+  }
+}
+
+function renderLocations(container, locations, empty) {
+  container.replaceChildren();
+  if (!locations?.length) {
+    container.textContent = empty;
+    return;
+  }
+  for (const location of locations) {
+    const row = document.createElement("div");
+    row.className = "reference-item";
+    const line = location.range?.start?.line || 0;
+    const character = location.range?.start?.character || 0;
+    row.textContent = `${workspaceRelative(location.path)}:${line + 1}:${character + 1}`;
+    row.addEventListener("click", () => openAbsoluteFile(location.path, line, character));
+    container.appendChild(row);
+  }
+}
+
+let renameTarget = null;
+
+async function startRename() {
+  const cursor = cursorPosition();
+  if (!cursor || !isJavaPath(cursor.path)) return;
+  if (!javaReady()) {
+    setStatus("Java language server is not ready");
+    return;
+  }
+  hideSignature();
+  let placeholder = "";
+  try {
+    const prepared = await invoke("java_prepare_rename", {
+      path: cursor.path,
+      line: cursor.line,
+      character: cursor.character,
+    });
+    if (!prepared) {
+      setStatus("This symbol cannot be renamed");
+      return;
+    }
+    placeholder = prepared.placeholder || "";
+  } catch (error) {
+    showError(String(error));
+    return;
+  }
+  renameTarget = cursor;
+  $("rename-input").value = placeholder;
+  $("rename-preview").textContent = placeholder
+    ? `Rename “${placeholder}”`
+    : "Rename the symbol at the cursor";
+  $("rename-dialog").classList.remove("hidden");
+  $("rename-input").focus();
+  $("rename-input").select();
+}
+
+function cancelRename() {
+  renameTarget = null;
+  $("rename-dialog").classList.add("hidden");
+}
+
+async function applyRename() {
+  const cursor = renameTarget;
+  const newName = $("rename-input").value.trim();
+  if (!cursor || !newName) return;
+  cancelRename();
+  setBusy(`Renaming to ${newName}…`);
+  try {
+    const files = await invoke("java_rename", {
+      path: cursor.path,
+      line: cursor.line,
+      character: cursor.character,
+      newName,
+    });
+    const count = await applyWorkspaceEdits(files);
+    setStatus(count ? `Renamed in ${files.length} file(s)` : "Rename made no changes");
+  } catch (error) {
+    showError(String(error));
+  } finally {
+    clearBusy();
+  }
+}
+
+async function showCodeActions() {
+  const cursor = cursorPosition();
+  if (!cursor || !isJavaPath(cursor.path)) return;
+  if (!javaReady()) {
+    setStatus("Java language server is not ready");
+    return;
+  }
+  const from = cursor.view.state.doc.lineAt(cursor.from);
+  const to = cursor.view.state.doc.lineAt(cursor.to);
+  const actions = await invoke("java_code_actions", {
+    path: cursor.path,
+    startLine: from.number - 1,
+    startCharacter: cursor.from - from.from,
+    endLine: to.number - 1,
+    endCharacter: cursor.to - to.from,
+  });
+  const list = $("code-action-list");
+  list.replaceChildren();
+  if (!actions?.length) {
+    setStatus("No code actions");
+    return;
+  }
+  for (const action of actions) {
+    const row = document.createElement("div");
+    row.className = `code-action-item${action.disabledReason ? " disabled" : ""}`;
+    row.textContent = `${action.preferred ? "★ " : ""}${action.title}`;
+    row.title = action.disabledReason || action.kind || "";
+    if (!action.disabledReason) {
+      row.addEventListener("click", () => applyCodeAction(action));
+    }
+    list.appendChild(row);
+  }
+  $("code-actions").classList.remove("hidden");
+}
+
+async function applyCodeAction(action) {
+  $("code-actions").classList.add("hidden");
+  if (!action.edits?.length) {
+    setStatus(action.disabledReason || "This code action has no text edit");
+    return;
+  }
+  const count = await applyWorkspaceEdits(action.edits);
+  setStatus(count ? action.title : "Code action made no changes");
+}
+
+async function applyWorkspaceEdits(files) {
+  if (!Array.isArray(files) || !files.length) return 0;
+  let count = 0;
+  for (const file of files) {
+    if (!file?.path || !file.path.startsWith(`${state.root}/`)) continue;
+    if (!state.docs.has(file.path)) {
+      const content = await call("read_file", { path: file.path });
+      state.docs.set(file.path, {
+        path: file.path,
+        name: fileName(file.path),
+        content,
+        dirty: false,
+      });
+    }
+    const view = paneForPath(file.path);
+    if (view) {
+      count += applyEditsOnView(view, file.edits || []);
+    } else {
+      const doc = state.docs.get(file.path);
+      const next = applyEditsToString(doc.content, file.edits || []);
+      if (next !== doc.content) {
+        doc.content = next;
+        doc.dirty = true;
+        count += (file.edits || []).length;
+      }
+    }
+    javaScheduleChange(file.path);
+  }
+  renderTabs();
+  showActiveDocument();
+  return count;
+}
+
+function paneForPath(path) {
+  for (const pane of ["primary", "secondary"]) {
+    if (panes[pane].path === path && panes[pane].view && (pane === "primary" || state.split)) {
+      return panes[pane].view;
+    }
+  }
+  return null;
+}
+
+function applyEditsOnView(view, edits) {
+  if (!edits.length) return 0;
+  const doc = view.state.doc;
+  const changes = edits
+    .map((edit) => ({
+      from: offsetAt(doc, edit.range?.start),
+      to: offsetAt(doc, edit.range?.end),
+      insert: edit.newText || "",
+    }))
+    .filter((change) => change.from <= change.to)
+    .sort((left, right) => left.from - right.from);
+  if (!changes.length) return 0;
+  view.dispatch({ changes });
+  return changes.length;
+}
+
+function applyEditsToString(text, edits) {
+  const newline = text.includes("\r\n") ? "\r\n" : "\n";
+  const lines = text.split(/\r?\n/);
+  const starts = [];
+  let offset = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    starts.push(offset);
+    offset += lines[index].length;
+    if (index < lines.length - 1) offset += newline.length;
+  }
+  const at = (position) => {
+    const line = Math.min(Math.max(position?.line || 0, 0), Math.max(lines.length - 1, 0));
+    return (starts[line] || 0) + Math.min(position?.character || 0, lines[line]?.length || 0);
+  };
+  const located = edits
+    .map((edit) => ({
+      from: at(edit.range?.start),
+      to: at(edit.range?.end),
+      insert: edit.newText || "",
+    }))
+    .filter((edit) => edit.from <= edit.to)
+    .sort((left, right) => right.from - left.from);
+  let result = text;
+  for (const edit of located) {
+    result = result.slice(0, edit.from) + edit.insert + result.slice(edit.to);
+  }
+  return result;
+}
+
+function hideSignature() {
+  $("signature-help").classList.add("hidden");
+}
+
+async function goToDocumentSymbol() {
+  const path = state.active;
+  if (!isJavaPath(path) || !javaReady()) {
+    setStatus("Open a Java file with the language server ready");
+    return;
+  }
+  const symbols = await invoke("java_document_symbols", { path });
+  const flat = [];
+  const walk = (items, prefix) => {
+    for (const symbol of items || []) {
+      flat.push({ ...symbol, title: `${prefix}${symbol.name}` });
+      walk(symbol.children, `${prefix}${symbol.name}.`);
+    }
+  };
+  walk(symbols, "");
+  openPalette("symbol", flat);
+}
+
+function openPalette(mode, symbols = []) {
+  paletteMode = mode;
+  paletteSymbols = symbols;
+  paletteIndex = 0;
+  const input = $("palette-input");
+  input.value = "";
+  input.placeholder = mode === "file" ? "Go to file" : "Type a command";
+  $("palette").classList.remove("hidden");
+  renderPalette();
+  input.focus();
+}
+
+function closePalette() {
+  $("palette").classList.add("hidden");
+}
+
+function paletteItems() {
+  const query = $("palette-input").value.trim().toLowerCase();
+  if (paletteMode === "symbol") {
+    return paletteSymbols
+      .filter((symbol) => !query || symbol.title.toLowerCase().includes(query) || symbol.name.toLowerCase().includes(query))
+      .slice(0, 50)
+      .map((symbol) => ({
+        title: symbol.title,
+        hint: symbol.kind || "",
+        run: () =>
+          openAbsoluteFile(
+            state.active,
+            symbol.selection?.start?.line || symbol.range?.start?.line || 0,
+            symbol.selection?.start?.character || symbol.range?.start?.character || 0,
+          ),
+      }));
+  }
+  if (paletteMode === "file") {
+    return state.files
+      .filter((entry) => !entry.isDir)
+      .filter((entry) => !query || entry.path.toLowerCase().includes(query))
+      .slice(0, 50)
+      .map((entry) => ({
+        title: entry.name,
+        hint: entry.path,
+        run: () => openFile(entry),
+      }));
+  }
+  return COMMANDS.filter((command) => !query || command.title.toLowerCase().includes(query));
+}
+
+function renderPalette() {
+  const items = paletteItems();
+  if (paletteIndex >= items.length) paletteIndex = 0;
+  const list = $("palette-list");
+  list.replaceChildren();
+  items.forEach((item, index) => {
+    const row = document.createElement("div");
+    row.className = `palette-item${index === paletteIndex ? " active" : ""}`;
+    const title = document.createElement("span");
+    title.textContent = item.title;
+    const hint = document.createElement("span");
+    hint.textContent = item.hint || "";
+    row.append(title, hint);
+    row.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+      closePalette();
+      item.run();
+    });
+    list.appendChild(row);
+  });
+}
+
+function runPaletteSelection() {
+  const item = paletteItems()[paletteIndex];
+  closePalette();
+  if (item) item.run();
+}
+
+async function jumpLike(command, label) {
+  const cursor = cursorPosition();
+  if (!cursor || !isJavaPath(cursor.path) || !javaReady()) {
+    setStatus("Java language server is not ready");
+    return;
+  }
+  const locations = await invoke(command, {
+    path: cursor.path,
+    line: cursor.line,
+    character: cursor.character,
+  });
+  if (!locations?.length) {
+    setStatus(`No ${label} found`);
+    return;
+  }
+  const target = locations[0];
+  await openAbsoluteFile(
+    target.path,
+    target.range?.start?.line || 0,
+    target.range?.start?.character || 0,
+  );
+  if (locations.length > 1) setStatus(`${locations.length} ${label} results; opened the first`);
+}
+
+async function openFolder() {
+  const directory = await open({ directory: true, multiple: false, title: "Open workspace" });
+  if (directory) await openWorkspace(directory);
+}
+
 /* ---------------- wiring ---------------- */
 
 function bindPanels() {
@@ -1537,10 +2280,11 @@ async function boot() {
   createEditor();
   bindPanels();
 
-  $("open-folder").addEventListener("click", async () => {
-    const directory = await open({ directory: true, multiple: false, title: "Open workspace" });
-    if (directory) await openWorkspace(directory);
-  });
+  $("open-folder").addEventListener("click", openFolder);
+  $("compile-java").addEventListener("click", () => runNamedTask("compileJava"));
+  $("run-java").addEventListener("click", () => runNamedTask("run", (task) => task.isRun && task.name === "run"));
+  $("test-java").addEventListener("click", () => runNamedTask("test", (task) => task.isTest && task.name === "test"));
+  $("command-palette").addEventListener("click", () => openPalette("command"));
   $("refresh-files").addEventListener("click", async () => {
     if (state.root) await openWorkspace(state.root);
   });
@@ -1565,6 +2309,19 @@ async function boot() {
   $("java-format").addEventListener("click", formatJavaDocument);
   $("java-organize").addEventListener("click", organizeJavaImports);
   $("java-clear-log").addEventListener("click", () => ($("java-log").textContent = ""));
+  $("java-settings-toggle").addEventListener("click", () => {
+    $("java-settings").classList.toggle("hidden");
+  });
+  $("java-settings-save").addEventListener("click", saveJavaSettings);
+  $("java-show-debug").addEventListener("click", showDebugLog);
+  $("rename-apply").addEventListener("click", applyRename);
+  $("rename-cancel").addEventListener("click", cancelRename);
+  $("rename-input").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      applyRename();
+    }
+  });
   const problemFilter = $("java-problem-filter");
   problemFilter.value = state.java.problemFilter;
   problemFilter.addEventListener("change", () => {
@@ -1591,6 +2348,12 @@ async function boot() {
     }
   });
 
+  await listen("gradle://output", (event) => {
+    const text = event.payload?.text;
+    if (typeof text !== "string" || !text) return;
+    state.gradleSawOutput = true;
+    appendGradleLog(text);
+  });
   await listen("opencode://event", (event) => handleAiEvent(event.payload));
   await listen("java://diagnostics", (event) => handleJavaDiagnostics(event.payload));
   await listen("java://event", (event) => {
@@ -1607,6 +2370,60 @@ async function boot() {
   });
   renderJava();
 
+  document.addEventListener("keydown", (event) => {
+    const paletteOpen = !$("palette").classList.contains("hidden");
+    if (event.key === "Escape") {
+      if (!$("rename-dialog").classList.contains("hidden")) {
+        event.preventDefault();
+        cancelRename();
+        return;
+      }
+      if (!$("code-actions").classList.contains("hidden")) {
+        event.preventDefault();
+        $("code-actions").classList.add("hidden");
+        return;
+      }
+      hideSignature();
+      if (paletteOpen) {
+        event.preventDefault();
+        closePalette();
+        return;
+      }
+    }
+    if (paletteOpen && event.key === "ArrowDown") {
+      event.preventDefault();
+      paletteIndex += 1;
+      renderPalette();
+      return;
+    }
+    if (paletteOpen && event.key === "ArrowUp") {
+      event.preventDefault();
+      paletteIndex = Math.max(0, paletteIndex - 1);
+      renderPalette();
+      return;
+    }
+    if (paletteOpen && event.key === "Enter") {
+      event.preventDefault();
+      runPaletteSelection();
+      return;
+    }
+    const mod = event.metaKey || event.ctrlKey;
+    if (mod && event.shiftKey && event.key.toLowerCase() === "p") {
+      event.preventDefault();
+      openPalette("command");
+    } else if (mod && !event.shiftKey && event.key.toLowerCase() === "p") {
+      event.preventDefault();
+      openPalette("file");
+    } else if (mod && event.key === "\\" ) {
+      event.preventDefault();
+      toggleSplit();
+    }
+  });
+  $("palette-input").addEventListener("input", () => {
+    paletteIndex = 0;
+    renderPalette();
+  });
+
   try {
     const root = await call("default_workspace");
     await openWorkspace(root);
@@ -1615,7 +2432,8 @@ async function boot() {
   }
 
   updateStatusRight();
-  aiConnect().catch(() => {});
+  loadJavaSettings().catch(() => {});
+  if (workspaceTrusted()) aiConnect().catch(() => {});
 }
 
 boot();

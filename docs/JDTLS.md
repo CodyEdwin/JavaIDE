@@ -32,7 +32,7 @@ for semantic results.
 
 | Component | Requirement | Policy |
 | --- | --- | --- |
-| jdtls runtime | **JDK 21+** | Bundle/provision a pinned Temurin JDK 21 or newer; allow override |
+| jdtls runtime | **JDK 25** for the pinned 1.64 snapshot (JDK 21+ is the older floor) | The shell prefers the newest discovered JDK so a JDK 25 install is used when both 21 and 25 exist |
 | Java source levels | Java 8–25 (current jdtls feature set) | Project JDKs are independent of the server runtime |
 | jdtls build | Pin one tested milestone (e.g. `1.61.x`) | Never auto-upgrade silently; show changelog and test before bumping |
 | Gradle (Buildship) | Gradle 8.5–9.x recommended | Test 8.x and 9.x; see compatibility notes below |

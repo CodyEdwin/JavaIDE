@@ -9,8 +9,10 @@ publish.workspace = true
 ide-jsonrpc = { path = "../ide-jsonrpc" }
 ide-platform = { path = "../ide-platform" }
 lsp-types = "0.97"
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

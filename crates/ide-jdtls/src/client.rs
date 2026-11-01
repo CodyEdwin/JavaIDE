@@ -15,14 +15,17 @@ use lsp_types::{
     CodeActionContext, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
     CompletionParams, CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentFormattingParams,
+    DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse,
     ExecuteCommandParams, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-    HoverParams, InitializeResult, PartialResultParams, Position, PublishDiagnosticsParams, Range,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
-    WorkDoneProgressParams, WorkspaceEdit,
+    HoverParams, InitializeResult, PartialResultParams, Position, PrepareRenameResponse,
+    PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams, RenameParams,
+    SignatureHelp, SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
+    WorkDoneProgressParams, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::ChildStderr;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -33,6 +36,11 @@ use crate::features::{
     CompletionCandidate, DocumentDiagnostics, HoverInfo, SourceLocation, SourcePosition,
     SourceTextEdit, completion_candidates, definition_locations, document_diagnostics, hover_info,
     text_edits, workspace_text_edits,
+};
+use crate::intelligence::{
+    FileEdits, JavaCodeAction, JavaSignature, JavaSymbol, PrepareRename, code_actions,
+    document_symbols, prepare_rename_view, reference_locations, signature_help_view,
+    workspace_file_edits, workspace_symbols,
 };
 use crate::text::apply_workspace_edit;
 
@@ -253,7 +261,7 @@ impl JdtlsClient {
         let (ready_sender, ready) = watch::channel(false);
         let (exit_sender, exit) = watch::channel(None);
         let (kill_sender, kill_receiver) = oneshot::channel();
-        let settings = Arc::new(RwLock::new(Value::Object(Map::new())));
+        let settings = Arc::new(RwLock::new(config.settings.clone()));
         let diagnostics = Arc::new(Mutex::new(HashMap::new()));
 
         spawn_process_monitor(child, kill_receiver, exit_sender, events.clone());
@@ -661,6 +669,314 @@ impl JdtlsClient {
         Ok(definition.map(definition_locations).unwrap_or_default())
     }
 
+    /// Requests signature help at `position`.
+    ///
+    /// An empty vector means jdtls has no signature at this position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JdtlsError::Timeout`] or [`JdtlsError::Protocol`] when the
+    /// response is missing or not a signature-help payload.
+    pub async fn signature_help(
+        &self,
+        path: &std::path::Path,
+        position: SourcePosition,
+        limit: Duration,
+    ) -> Result<Vec<JavaSignature>, JdtlsError> {
+        let params = SignatureHelpParams {
+            context: Some(lsp_types::SignatureHelpContext {
+                trigger_kind: lsp_types::SignatureHelpTriggerKind::INVOKED,
+                trigger_character: None,
+                is_retrigger: false,
+                active_signature_help: None,
+            }),
+            text_document_position_params: text_document_position(path, position)?,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+        let help: Option<SignatureHelp> = self
+            .lsp("textDocument/signatureHelp", params, limit)
+            .await?;
+        Ok(help.map(signature_help_view).unwrap_or_default())
+    }
+
+    /// Finds references to the symbol at `position`.
+    ///
+    /// `include_declaration` asks jdtls to include the declaration itself.
+    /// Virtual documents are dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JdtlsError::Timeout`] or [`JdtlsError::Protocol`].
+    pub async fn references(
+        &self,
+        path: &std::path::Path,
+        position: SourcePosition,
+        include_declaration: bool,
+        limit: Duration,
+    ) -> Result<Vec<SourceLocation>, JdtlsError> {
+        self.goto_locations(
+            "textDocument/references",
+            path,
+            position,
+            Some(include_declaration),
+            limit,
+        )
+        .await
+    }
+
+    /// Finds implementations of the symbol at `position`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JdtlsError::Timeout`] or [`JdtlsError::Protocol`].
+    pub async fn implementation(
+        &self,
+        path: &std::path::Path,
+        position: SourcePosition,
+        limit: Duration,
+    ) -> Result<Vec<SourceLocation>, JdtlsError> {
+        self.goto_locations("textDocument/implementation", path, position, None, limit)
+            .await
+    }
+
+    /// Finds the type definition of the symbol at `position`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JdtlsError::Timeout`] or [`JdtlsError::Protocol`].
+    pub async fn type_definition(
+        &self,
+        path: &std::path::Path,
+        position: SourcePosition,
+        limit: Duration,
+    ) -> Result<Vec<SourceLocation>, JdtlsError> {
+        self.goto_locations("textDocument/typeDefinition", path, position, None, limit)
+            .await
+    }
+
+    /// Asks whether the symbol at `position` can be renamed.
+    ///
+    /// `Ok(None)` means jdtls refused the position (not a renameable symbol).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JdtlsError::Timeout`] or [`JdtlsError::Protocol`].
+    pub async fn prepare_rename(
+        &self,
+        path: &std::path::Path,
+        position: SourcePosition,
+        limit: Duration,
+    ) -> Result<Option<PrepareRename>, JdtlsError> {
+        let params = text_document_position(path, position)?;
+        let response: Option<PrepareRenameResponse> = self
+            .lsp("textDocument/prepareRename", params, limit)
+            .await?;
+        Ok(response.map(prepare_rename_view))
+    }
+
+    /// Renames the symbol at `position` to `new_name`.
+    ///
+    /// The returned edits are grouped by file. The caller applies them to open
+    /// buffers as one undo step per file and does not write them to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JdtlsError::Timeout`] or [`JdtlsError::Protocol`]. An invalid
+    /// name is a protocol error from jdtls.
+    pub async fn rename(
+        &self,
+        path: &std::path::Path,
+        position: SourcePosition,
+        new_name: &str,
+        limit: Duration,
+    ) -> Result<Vec<FileEdits>, JdtlsError> {
+        let params = RenameParams {
+            text_document_position: text_document_position(path, position)?,
+            new_name: new_name.to_owned(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+        let edit: Option<WorkspaceEdit> = self.lsp("textDocument/rename", params, limit).await?;
+        Ok(edit
+            .map(|edit| workspace_file_edits(&edit))
+            .unwrap_or_default())
+    }
+
+    /// Requests code actions for `range`.
+    ///
+    /// Actions that carry lazy `data` and no edit are resolved before they are
+    /// returned, up to [`crate::intelligence::MAX_CODE_ACTIONS`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JdtlsError::Timeout`] or [`JdtlsError::Protocol`].
+    pub async fn code_actions(
+        &self,
+        path: &std::path::Path,
+        range: crate::features::SourceRange,
+        limit: Duration,
+    ) -> Result<Vec<JavaCodeAction>, JdtlsError> {
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier {
+                uri: file_uri(path)?,
+            },
+            range: lsp_range(range),
+            context: CodeActionContext {
+                diagnostics: Vec::new(),
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let actions: Option<CodeActionResponse> =
+            self.lsp("textDocument/codeAction", params, limit).await?;
+        let mut resolved = Vec::new();
+        for action in actions.unwrap_or_default() {
+            resolved.push(self.resolve_code_action(action, limit).await?);
+        }
+        Ok(code_actions(resolved))
+    }
+
+    /// Formats `range` inside the document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JdtlsError::Timeout`] or [`JdtlsError::Protocol`].
+    pub async fn format_range(
+        &self,
+        path: &std::path::Path,
+        range: crate::features::SourceRange,
+        tab_size: u32,
+        insert_spaces: bool,
+        limit: Duration,
+    ) -> Result<Vec<SourceTextEdit>, JdtlsError> {
+        let params = DocumentRangeFormattingParams {
+            text_document: TextDocumentIdentifier {
+                uri: file_uri(path)?,
+            },
+            range: lsp_range(range),
+            options: FormattingOptions {
+                tab_size,
+                insert_spaces,
+                ..FormattingOptions::default()
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+        let edits: Option<Vec<TextEdit>> = self
+            .lsp("textDocument/rangeFormatting", params, limit)
+            .await?;
+        Ok(edits.map(text_edits).unwrap_or_default())
+    }
+
+    /// Returns the hierarchical outline of one document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JdtlsError::Timeout`] or [`JdtlsError::Protocol`].
+    pub async fn document_symbols(
+        &self,
+        path: &std::path::Path,
+        limit: Duration,
+    ) -> Result<Vec<JavaSymbol>, JdtlsError> {
+        let params = DocumentSymbolParams {
+            text_document: TextDocumentIdentifier {
+                uri: file_uri(path)?,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let response: Option<DocumentSymbolResponse> = self
+            .lsp("textDocument/documentSymbol", params, limit)
+            .await?;
+        Ok(response.map(document_symbols).unwrap_or_default())
+    }
+
+    /// Searches workspace symbols.
+    ///
+    /// An empty `query` asks jdtls for its default index slice. Results are
+    /// capped by the server; this method does not add a second cap beyond
+    /// dropping virtual documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JdtlsError::Timeout`] or [`JdtlsError::Protocol`].
+    pub async fn workspace_symbols(
+        &self,
+        query: &str,
+        limit: Duration,
+    ) -> Result<Vec<JavaSymbol>, JdtlsError> {
+        let params = WorkspaceSymbolParams {
+            query: query.to_owned(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let response: Option<WorkspaceSymbolResponse> =
+            self.lsp("workspace/symbol", params, limit).await?;
+        Ok(response.map(workspace_symbols).unwrap_or_default())
+    }
+
+    async fn goto_locations(
+        &self,
+        method: &str,
+        path: &std::path::Path,
+        position: SourcePosition,
+        include_declaration: Option<bool>,
+        limit: Duration,
+    ) -> Result<Vec<SourceLocation>, JdtlsError> {
+        if method == "textDocument/references" {
+            let params = ReferenceParams {
+                text_document_position: text_document_position(path, position)?,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                context: ReferenceContext {
+                    include_declaration: include_declaration.unwrap_or(true),
+                },
+            };
+            let locations: Option<Vec<lsp_types::Location>> =
+                self.lsp(method, params, limit).await?;
+            return Ok(reference_locations(locations.unwrap_or_default()));
+        }
+        let params = GotoDefinitionParams {
+            text_document_position_params: text_document_position(path, position)?,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let response: Option<GotoDefinitionResponse> = self.lsp(method, params, limit).await?;
+        Ok(response.map(definition_locations).unwrap_or_default())
+    }
+
+    async fn resolve_code_action(
+        &self,
+        action: CodeActionOrCommand,
+        limit: Duration,
+    ) -> Result<CodeActionOrCommand, JdtlsError> {
+        let CodeActionOrCommand::CodeAction(code_action) = &action else {
+            return Ok(action);
+        };
+        if code_action.edit.is_some() || code_action.data.is_none() {
+            return Ok(action);
+        }
+        let resolved: CodeActionOrCommand = self
+            .lsp("codeAction/resolve", &action, limit)
+            .await
+            .unwrap_or(action);
+        Ok(resolved)
+    }
+
+    async fn lsp<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: impl serde::Serialize,
+        limit: Duration,
+    ) -> Result<T, JdtlsError> {
+        let response = self
+            .peer
+            .request_with_timeout(method, Some(serde_json::to_value(params)?), limit)
+            .await?;
+        serde_json::from_value(response)
+            .map_err(|error| JdtlsError::Protocol(format!("invalid {method} response: {error}")))
+    }
+
     /// Waits for the next diagnostics publication for `uri`.
     ///
     /// Returns the cached publication if one already exists, so this is safe to
@@ -839,6 +1155,7 @@ impl JdtlsClient {
                 JdtlsError::Protocol(format!("invalid code action response: {error}"))
             })?;
         for action in actions.unwrap_or_default() {
+            let action = self.resolve_code_action(action, limit).await?;
             let CodeActionOrCommand::CodeAction(action) = action else {
                 continue;
             };
@@ -948,6 +1265,19 @@ async fn probe_java_major(java: &std::path::Path) -> Result<u32, JdtlsError> {
                 .to_owned(),
         )
     })
+}
+
+fn lsp_range(range: crate::features::SourceRange) -> Range {
+    Range {
+        start: Position {
+            line: range.start.line,
+            character: range.start.character,
+        },
+        end: Position {
+            line: range.end.line,
+            character: range.end.character,
+        },
+    }
 }
 
 fn text_document_position(

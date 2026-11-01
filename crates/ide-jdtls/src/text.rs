@@ -51,6 +51,9 @@ pub fn apply_workspace_edit(
             "documentChanges edits are not supported in Phase 0".to_owned(),
         ));
     }
+    // `Uri` caches its parsed form in a `Cell`. Hash and equality ignore that
+    // cache, so holding the server's change map is sound.
+    #[allow(clippy::mutable_key_type)]
     let changes = edit.changes.as_ref().ok_or_else(|| {
         JdtlsError::WorkspaceEdit("workspace edit contains no changes".to_owned())
     })?;

@@ -378,7 +378,7 @@ pub(crate) fn definition_locations(response: GotoDefinitionResponse) -> Vec<Sour
     locations.into_iter().filter_map(location_view).collect()
 }
 
-fn location_view(location: Location) -> Option<SourceLocation> {
+pub(crate) fn location_view(location: Location) -> Option<SourceLocation> {
     let path = uri_to_path(&location.uri).ok()?;
     Some(SourceLocation {
         path,
@@ -532,6 +532,8 @@ mod tests {
     #[test]
     fn extracts_edits_for_the_requested_document() {
         let document = uri("file:///tmp/App.java");
+        // See `apply_workspace_edit`: `Uri` interior mutability is a parse cache.
+        #[allow(clippy::mutable_key_type)]
         let mut changes = std::collections::HashMap::new();
         changes.insert(
             document.clone(),

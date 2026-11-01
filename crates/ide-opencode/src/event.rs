@@ -116,10 +116,7 @@ impl SseDecoder {
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<RawEvent>, OpenCodeError> {
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
-        loop {
-            let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') else {
-                break;
-            };
+        while let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
             let line = self.buffer.drain(..=newline).collect::<Vec<_>>();
             // Drop the LF and an optional CR.
             let line = &line[..line.len() - 1];

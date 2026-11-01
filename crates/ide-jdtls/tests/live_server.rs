@@ -1,7 +1,8 @@
 //! Live jdtls integration test for the language feature surface.
 //!
-//! Ignored by default because it needs a JDK 21+ and an extracted jdtls
-//! distribution. Run it explicitly:
+//! Ignored by default because it needs an extracted jdtls distribution and a
+//! JDK new enough for that build (the pinned 1.64 snapshot needs JDK 25).
+//! Run it explicitly:
 //!
 //! ```sh
 //! JAVAIDE_JDTLS_HOME=/path/to/jdtls \
@@ -31,7 +32,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
 #[tokio::test]
-#[ignore = "requires JDK 21+ and an extracted jdtls distribution"]
+#[ignore = "requires JDK 25+ and an extracted jdtls distribution"]
 async fn jdtls_serves_diagnostics_hover_completion_and_definition() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/java-gradle")
@@ -204,6 +205,101 @@ async fn jdtls_serves_diagnostics_hover_completion_and_definition() {
         "organize imports kept the unused import: {organized}"
     );
 
+    let signature_positions = [
+        SourcePosition::new(call_line, call_character + "add(".len() as u32),
+        SourcePosition::new(call_line, call_character + "add".len() as u32),
+        hover_position,
+    ];
+    let mut signatures = Vec::new();
+    let mut signature_note = String::new();
+    for position in signature_positions {
+        match client
+            .signature_help(&file, position, REQUEST_TIMEOUT)
+            .await
+        {
+            Ok(found)
+                if found
+                    .iter()
+                    .any(|signature| signature.label.contains("add")) =>
+            {
+                signatures = found;
+                break;
+            }
+            Ok(found) => signature_note = format!("empty at {position:?}: {found:?}"),
+            Err(error) => signature_note = format!("error at {position:?}: {error}"),
+        }
+    }
+    assert!(
+        signatures
+            .iter()
+            .any(|signature| signature.label.contains("add")),
+        "signature help did not describe add ({signature_note})"
+    );
+
+    let references = client
+        .references(&file, hover_position, true, REQUEST_TIMEOUT)
+        .await
+        .expect("references");
+    assert!(
+        references.len() >= 2,
+        "expected the declaration and the call of add, got {references:?}"
+    );
+
+    let symbols = client
+        .document_symbols(&file, REQUEST_TIMEOUT)
+        .await
+        .expect("document symbols");
+    let names = flatten_names(&symbols);
+    assert!(
+        names.iter().any(|name| name.starts_with("add"))
+            && names.iter().any(|name| name.starts_with("main")),
+        "outline missing add/main: {names:?}"
+    );
+
+    let renamed = client
+        .rename(&file, hover_position, "sum", REQUEST_TIMEOUT)
+        .await
+        .expect("rename");
+    assert!(
+        renamed
+            .iter()
+            .any(|file| { file.edits.iter().any(|edit| edit.new_text.contains("sum")) }),
+        "rename did not produce a `sum` edit: {renamed:?}"
+    );
+
+    let broken = project.join("src/main/java/com/example/Broken.java");
+    let broken_source =
+        "package com.example;\npublic class Broken {\n  void m() {\n    int value = 1\n  }\n}\n";
+    std::fs::write(&broken, broken_source).expect("write broken file");
+    client
+        .open_document(&broken, broken_source, 1)
+        .await
+        .expect("open broken file");
+    let mut actions = Vec::new();
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    while Instant::now() < deadline && actions.is_empty() {
+        if let Ok(found) = client
+            .code_actions(
+                &broken,
+                ide_jdtls::SourceRange {
+                    start: SourcePosition::new(3, 4),
+                    end: SourcePosition::new(3, 16),
+                },
+                REQUEST_TIMEOUT,
+            )
+            .await
+            && !found.is_empty()
+        {
+            actions = found;
+            break;
+        }
+        tokio::time::sleep(RETRY_INTERVAL).await;
+    }
+    assert!(
+        actions.iter().any(|action| !action.title.is_empty()),
+        "expected a code action for the broken file, got {actions:?}"
+    );
+
     client
         .shutdown(Duration::from_secs(15))
         .await
@@ -226,6 +322,15 @@ fn apply_edits(text: &str, edits: &[SourceTextEdit]) -> String {
         }
     }
     result
+}
+
+fn flatten_names(symbols: &[ide_jdtls::JavaSymbol]) -> Vec<String> {
+    let mut names = Vec::new();
+    for symbol in symbols {
+        names.push(symbol.name.clone());
+        names.extend(flatten_names(&symbol.children));
+    }
+    names
 }
 
 fn offset_in(text: &str, position: SourcePosition) -> usize {
@@ -268,9 +373,26 @@ fn find_java_home() -> Option<PathBuf> {
         }
     }
     candidates.extend(version_directories(&data_dir().join("runtimes")));
+    if let Ok(entries) = std::fs::read_dir("/usr/lib/jvm") {
+        candidates.extend(entries.filter_map(Result::ok).map(|entry| entry.path()));
+    }
     candidates
         .into_iter()
-        .find(|home| home.join("bin").join("java").is_file())
+        .filter(|home| home.join("bin").join("java").is_file())
+        .max_by_key(|home| java_major(home).unwrap_or(0))
+}
+
+fn java_major(home: &Path) -> Option<u32> {
+    let output = std::process::Command::new(home.join("bin").join("java"))
+        .arg("-version")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stderr);
+    let start = text.find('"')? + 1;
+    let end = text[start..].find('"')? + start;
+    let version = &text[start..end];
+    let major = version.strip_prefix("1.").unwrap_or(version);
+    major.split('.').next()?.parse().ok()
 }
 
 fn version_directories(root: &Path) -> Vec<PathBuf> {

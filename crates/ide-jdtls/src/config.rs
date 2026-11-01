@@ -4,12 +4,15 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use lsp_types::{
-    ClientCapabilities, ClientInfo, CodeActionClientCapabilities, CodeActionKindLiteralSupport,
-    CodeActionLiteralSupport, DocumentFormattingClientCapabilities, FailureHandlingKind,
-    GeneralClientCapabilities, InitializeParams, PositionEncodingKind,
-    PublishDiagnosticsClientCapabilities, TextDocumentClientCapabilities,
+    ClientCapabilities, ClientInfo, CodeActionCapabilityResolveSupport,
+    CodeActionClientCapabilities, CodeActionKindLiteralSupport, CodeActionLiteralSupport,
+    DocumentFormattingClientCapabilities, DocumentRangeFormattingClientCapabilities,
+    DocumentSymbolClientCapabilities, FailureHandlingKind, GeneralClientCapabilities,
+    GotoCapability, HoverClientCapabilities, InitializeParams, MarkupKind, PositionEncodingKind,
+    PublishDiagnosticsClientCapabilities, RenameClientCapabilities,
+    SignatureHelpClientCapabilities, SignatureInformationSettings, TextDocumentClientCapabilities,
     TextDocumentSyncClientCapabilities, Uri, WindowClientCapabilities, WorkspaceClientCapabilities,
-    WorkspaceEditClientCapabilities, WorkspaceFolder,
+    WorkspaceEditClientCapabilities, WorkspaceFolder, WorkspaceSymbolClientCapabilities,
 };
 use serde_json::{Map, Value, json};
 use url::Url;
@@ -94,6 +97,9 @@ pub struct JdtlsConfig {
     pub bundles: Vec<PathBuf>,
     /// Additional JVM arguments appended after the defaults.
     pub vm_args: Vec<String>,
+    /// Settings document sent as `initializationOptions.settings` and served
+    /// from `workspace/configuration`. An empty object means "no preferences".
+    pub settings: Value,
     /// Additional jdtls arguments appended after `-data`.
     pub extra_args: Vec<String>,
     /// OSGi log level passed as `-Dlog.level` (for example `WARN`).
@@ -120,6 +126,8 @@ impl JdtlsConfig {
             workspace_root: workspace_root.into(),
             bundles: Vec::new(),
             vm_args: Vec::new(),
+            // jdtls leaves signature help off unless the client asks for it.
+            settings: json!({ "java": { "signatureHelp": { "enabled": true } } }),
             extra_args: Vec::new(),
             log_level: "WARN".to_owned(),
             initialize_timeout: std::time::Duration::from_secs(120),
@@ -205,6 +213,9 @@ impl JdtlsConfig {
                 .collect();
             options.insert("bundles".to_owned(), json!(bundles));
         }
+        if !self.settings.is_null() {
+            options.insert("settings".to_owned(), self.settings.clone());
+        }
         params.initialization_options = Some(Value::Object(options));
         Ok(params)
     }
@@ -260,6 +271,10 @@ fn client_capabilities() -> ClientCapabilities {
         }),
         workspace_folders: Some(true),
         configuration: Some(true),
+        symbol: Some(WorkspaceSymbolClientCapabilities {
+            dynamic_registration: Some(false),
+            ..WorkspaceSymbolClientCapabilities::default()
+        }),
         ..WorkspaceClientCapabilities::default()
     };
 
@@ -270,6 +285,27 @@ fn client_capabilities() -> ClientCapabilities {
             will_save_wait_until: Some(false),
             did_save: Some(true),
         }),
+        hover: Some(HoverClientCapabilities {
+            dynamic_registration: Some(false),
+            content_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
+        }),
+        signature_help: Some(SignatureHelpClientCapabilities {
+            dynamic_registration: Some(false),
+            signature_information: Some(SignatureInformationSettings {
+                documentation_format: Some(vec![MarkupKind::PlainText, MarkupKind::Markdown]),
+                active_parameter_support: Some(true),
+                ..SignatureInformationSettings::default()
+            }),
+            context_support: Some(true),
+        }),
+        references: Some(lsp_types::ReferenceClientCapabilities {
+            dynamic_registration: Some(false),
+        }),
+        document_symbol: Some(DocumentSymbolClientCapabilities {
+            dynamic_registration: Some(false),
+            hierarchical_document_symbol_support: Some(true),
+            ..DocumentSymbolClientCapabilities::default()
+        }),
         publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
             related_information: Some(true),
             version_support: Some(true),
@@ -278,14 +314,49 @@ fn client_capabilities() -> ClientCapabilities {
         formatting: Some(DocumentFormattingClientCapabilities {
             dynamic_registration: Some(false),
         }),
+        range_formatting: Some(DocumentRangeFormattingClientCapabilities {
+            dynamic_registration: Some(false),
+        }),
+        definition: Some(GotoCapability {
+            dynamic_registration: Some(false),
+            link_support: Some(true),
+        }),
+        type_definition: Some(GotoCapability {
+            dynamic_registration: Some(false),
+            link_support: Some(true),
+        }),
+        implementation: Some(GotoCapability {
+            dynamic_registration: Some(false),
+            link_support: Some(true),
+        }),
+        rename: Some(RenameClientCapabilities {
+            dynamic_registration: Some(false),
+            prepare_support: Some(true),
+            ..RenameClientCapabilities::default()
+        }),
         // jdtls only returns literal code actions (with an embedded edit) when
         // the client advertises the kinds it understands.
         code_action: Some(CodeActionClientCapabilities {
             dynamic_registration: Some(false),
             code_action_literal_support: Some(CodeActionLiteralSupport {
                 code_action_kind: CodeActionKindLiteralSupport {
-                    value_set: vec!["source.organizeImports".to_owned()],
+                    value_set: vec![
+                        "quickfix".to_owned(),
+                        "refactor".to_owned(),
+                        "refactor.extract".to_owned(),
+                        "refactor.inline".to_owned(),
+                        "refactor.rewrite".to_owned(),
+                        "source".to_owned(),
+                        "source.organizeImports".to_owned(),
+                        "source.fixAll".to_owned(),
+                    ],
                 },
+            }),
+            is_preferred_support: Some(true),
+            disabled_support: Some(true),
+            data_support: Some(true),
+            resolve_support: Some(CodeActionCapabilityResolveSupport {
+                properties: vec!["edit".to_owned()],
             }),
             ..CodeActionClientCapabilities::default()
         }),
@@ -415,6 +486,8 @@ pub fn is_launcher_jar(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -435,6 +508,24 @@ mod tests {
         assert!(!is_launcher_jar(Path::new(
             "org.eclipse.equinox.launcher.jar"
         )));
+    }
+
+    #[test]
+    fn initialize_params_include_settings() {
+        let config = JdtlsConfig::new(
+            "/tmp/java",
+            JdtlsInstallation::new("/tmp/jdtls", "/tmp/launcher.jar", "/tmp/config"),
+            "/tmp/data",
+            "/tmp/workspace",
+        );
+        let mut config = config;
+        config.settings = json!({ "java": { "format": { "enabled": false } } });
+        let params = config.initialize_params().expect("params");
+        let options = params.initialization_options.expect("options");
+        assert_eq!(
+            options["settings"]["java"]["format"]["enabled"],
+            json!(false)
+        );
     }
 
     #[test]

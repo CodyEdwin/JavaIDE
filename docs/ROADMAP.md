@@ -115,9 +115,12 @@ record the protocol traffic that becomes the first contract tests.
 
 ## 4. Phase 1 — IDE shell, basic LSP, and OpenCode chat (4–6 weeks)
 
-> **Status (2026-10-29):** in progress. Diagnostics, hover, completion,
-> go-to-definition, formatting, and organize imports are wired into the shell;
-> the remaining checklist lives in [PHASE1_STATUS.md](PHASE1_STATUS.md).
+> **Status (2026-10-31):** the usable core is in place. Edit/save, diagnostics,
+> completion, hover, definition, format, organize imports, workspace trust,
+> Java settings, the command palette, a split editor, and Gradle
+> compile/run/test all work from the shell. Multi-root workspaces and the
+> generated TypeScript command bindings remain. See
+> [PHASE1_STATUS.md](PHASE1_STATUS.md).
 
 **Goal:** a real window that opens a Java workspace, edits files, navigates, and
 hosts a streaming OpenCode conversation.
@@ -161,6 +164,14 @@ hosts a streaming OpenCode conversation.
 - OpenCode context/permissions/MCP tools/diffs.
 
 ## 5. Phase 2 — Complete Java intelligence (4–6 weeks)
+
+> **Status (2026-11-01):** in progress. Signature help, references,
+> implementations, type definition, rename, code actions (with resolve),
+> document and workspace symbols, and range formatting are wired through
+> `ide-jdtls` into the shell. The pinned jdtls 1.64 snapshot is downloaded on
+> first launch. Semantic tokens, inlay hints, hierarchies, code lens,
+> multi-root import, and the OpenCode permission inbox are still ahead. See
+> [PHASE2_STATUS.md](PHASE2_STATUS.md).
 
 **Goal:** the jdtls adapter is feature-complete for v1 and robust against real
 projects.

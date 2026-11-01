@@ -1,12 +1,12 @@
 # Phase 1 status
 
-- **Last updated:** 2026-10-29
+- **Last updated:** 2026-10-31
 - **Phase goal:** a real window that opens a Java workspace, edits files,
   navigates, and hosts a streaming OpenCode conversation
   ([ROADMAP.md](ROADMAP.md#4-phase-1--ide-shell-basic-lsp-and-opencode-chat-46-weeks)).
-- **Overall:** in progress. The shell, editor, Gradle panel, OpenCode chat, and
-  the basic jdtls feature surface exist. Refactoring/navigation breadth and the
-  quality gates are the remaining work.
+- **Overall:** the usable core is in place. A trusted single-module Gradle
+  project can be edited, compiled, run, and tested from the shell. Phase 2
+  (rename, hierarchy, semantic tokens, multi-root import) has not started.
 
 This page is the working checklist for Phase 1. Update it with the code change
 that changes the status, not afterwards.
@@ -27,7 +27,14 @@ that changes the status, not afterwards.
 | Document sync | Full-text `didOpen`/`didChange` (debounced 350 ms), `didSave`, `didClose`, monotonic versions | `JdtlsClient::change_document` |
 | Formatting | `textDocument/formatting`, applied to the buffer as one undo step (`Shift+Alt+F`) | `JdtlsClient::format_document` |
 | Organize imports | `source.organizeImports` code action, applied to the buffer (`Shift+Alt+O`) | `JdtlsClient::organize_imports` |
-| OpenCode chat | Connect, sessions, context, streaming, stop, reconnect-by-refetch | `crates/ide-opencode`, AI panel |
+| OpenCode chat | Connect, sessions, context, streaming, stop, reconnect-by-refetch. Connect and prompt are refused until the folder is trusted | `crates/ide-opencode`, AI panel |
+| Problems | Grouped by file, severity filter with counts, related locations, clear on close | Java panel |
+| jdtls log | Warn, error, and info stay in the panel. LSP log/debug (level ≥ 4) goes to a 200-line ring and is shown on demand | `java_debug_log` |
+| Settings | `java.format.enabled`, completion favorites/import order/guess-arguments, and `java.jdt.ls.vmargs`. User file or workspace `.javaide/settings.toml`. VM arguments are marked restart-required and passed on the next jdtls launch | `crates/ide-config` |
+| Trust | Unknown folders cannot start jdtls, Gradle, or OpenCode. Trust and restrict are persisted in `trust.json` | banner, `set_workspace_trust` |
+| Commands | Palette (`Ctrl/Cmd+Shift+P`), quick open (`Ctrl/Cmd+P`), split editor (`Ctrl/Cmd+\`) | toolbar, command list in `main.js` |
+| Compile / run / test | Toolbar buttons run Gradle `compileJava`, `run`, and `test` and stream task output | Gradle panel |
+| Quality gates | `xtask check-architecture`, `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test`, Gradle sidecar tests, webview build. Linux CI workflow | `crates/xtask`, `.github/workflows/ci.yml` |
 
 ### Verification performed
 
@@ -49,43 +56,34 @@ that changes the status, not afterwards.
   bundles on Temurin 21.0.13 and works on Temurin 25.0.5. The “JDK 21+” runtime
   claim below needs a pinned version pair per release.
 
-## Remaining Phase 1 work
+## Still ahead (not part of the usable core)
 
-Ordered so each item leaves the app usable.
-
-1. **Problems panel depth.** Group by file/project, filter by severity, show
-   related information, and clear publications for closed documents.
-2. **jdtls log surface.** `window/logMessage` text is currently appended raw;
-   route debug-level output to a bounded ring buffer and keep warn/error in the
-   panel.
-3. **Settings.** Persist `java.format.enabled`, `java.completion.*`, and
-   `java.jdt.ls.vmargs`, map them through `workspace/configuration`, and mark
-   restart-required settings.
-4. **Workspace trust prompt.** Gate jdtls import and Gradle execution behind an
-   explicit trust decision for the opened folder.
-5. **Editor breadth.** Split editors and a command palette (tabs and
-   multi-cursor already work through `basicSetup`).
-6. **Quality gates.** `cargo xtask check-architecture`, rustdoc checks, and
-   committed `ts-rs` bindings do not exist yet. At minimum, add
-   formatting/clippy/doc CI and the `xtask` architecture allowlist described in
-   [ENGINEERING.md](ENGINEERING.md). A workspace-wide
-   `cargo clippy -- -D warnings` still reports two pre-existing lints outside
-   this change: `clippy::while_let_loop` in `ide-opencode/src/event.rs` and
-   `clippy::mutable_key_type` in `ide-jdtls/src/text.rs`.
-7. **Remote/multi-root.** Single-root workspaces only; multi-root is Phase 2.
+1. **`ide-ui-api` and `ts-rs` bindings.** The shell still serializes its own
+   command structs. Introducing the command crate now would move types without
+   changing what a user can do, so it stays with the Phase 2 boundary work.
+2. **Workspace lint opt-in.** `cargo clippy --workspace --all-targets -- -D warnings`
+   passes. Crates do not yet opt into the pedantic workspace lint table in
+   [ENGINEERING.md](ENGINEERING.md); turning that on across the existing crates
+   is a separate cleanup.
+3. **macOS and Windows CI.** The GitHub workflow runs on Ubuntu. Those
+   platforms are not built here.
+4. **Remote/multi-root.** Single-root workspaces only; multi-root is Phase 2.
+5. **Run configurations.** Compile, run, and test go through Gradle tasks.
+   Args, env, cwd, and a main-class launcher that is not the Gradle `run` task
+   are Phase 4.
 
 ## Phase 1 exit criteria
 
 | Criterion | Status |
 | --- | --- |
-| Open a single-module Gradle fixture, edit and save `.java`, see diagnostics after jdtls is ready | Verified live on the fixture sources (imported as a plain Java project); the editor save path is unchanged from Phase 0 |
-| Completion, hover, and go-to-definition for JDK and project types | Verified live by the opt-in `live_server` test |
-| Formatting and organize imports apply as one atomic, undoable step | Verified live: edits are applied in a single buffer transaction |
-| A jdtls crash is visible and recoverable; unsaved buffers survive | Crash marks the session failed and offers Restart; buffers live in the webview and are untouched. Recoverable by design, not yet exercised live |
-| App runs on Linux and macOS; Windows builds in CI | Linux is the development target; macOS/Windows CI is not set up |
-| OpenCode chat streams and can be stopped without freezing the UI | Implemented in Phase 0 shell |
-| A workspace with OpenCode disabled has no assistant errors | Connection failures are reported in the AI panel only |
-| `xtask check-architecture`, clippy, rustdoc, TS binding checks pass | Not implemented (see item 7) |
+| Open a single-module Gradle fixture, edit and save `.java`, see diagnostics after jdtls is ready | Editor open/save verified in the running shell. Diagnostics were verified earlier by the live jdtls test; this environment has no extracted jdtls, so the panel correctly reports Java unavailable |
+| Completion, hover, and go-to-definition for JDK and project types | Implemented. The opt-in `live_server` test is skipped unless `JAVAIDE_JDTLS_HOME` is set |
+| Formatting and organize imports apply as one atomic, undoable step | Implemented; edits are one buffer transaction |
+| A jdtls crash is visible and recoverable; unsaved buffers survive | Crash marks the session failed and offers Restart; buffers live in the webview |
+| App runs on Linux and macOS; Windows builds in CI | Linux launch verified. macOS/Windows CI is not set up |
+| OpenCode chat streams and can be stopped without freezing the UI | Implemented. Connect and prompt wait for workspace trust |
+| A workspace with OpenCode disabled has no assistant errors | Connection failures stay in the AI panel. An untrusted folder does not connect |
+| `xtask check-architecture`, clippy, and tests pass | `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test --workspace`, and `xtask check-architecture` pass. `ts-rs` bindings are not generated yet |
 
 ## How to verify locally
 
@@ -123,5 +121,6 @@ apply as one undo step and never touch the file until you save.
 Phase 2 completes the jdtls feature matrix (signature help, references,
 rename, code actions, semantic tokens, inlay hints, hierarchy, code lens),
 hardens project import against multi-module and broken builds, and adds the
-OpenCode permission reply flow. See
+OpenCode permission reply flow. The command types should move into `ide-ui-api`
+when that work starts, so the shell stops owning protocol-adjacent DTOs. See
 [ROADMAP.md](ROADMAP.md#5-phase-2--complete-java-intelligence-46-weeks).
