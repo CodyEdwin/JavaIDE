@@ -378,7 +378,7 @@ pub(crate) fn definition_locations(response: GotoDefinitionResponse) -> Vec<Sour
     locations.into_iter().filter_map(location_view).collect()
 }
 
-fn location_view(location: Location) -> Option<SourceLocation> {
+pub(crate) fn location_view(location: Location) -> Option<SourceLocation> {
     let path = uri_to_path(&location.uri).ok()?;
     Some(SourceLocation {
         path,

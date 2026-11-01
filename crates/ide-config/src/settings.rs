@@ -125,6 +125,8 @@ impl JavaSettings {
         json!({
             "java": {
                 "format": { "enabled": self.format_enabled },
+                "signatureHelp": { "enabled": true },
+                "import": { "generatesMetadataFilesAtProjectRoot": false },
                 "completion": {
                     "enabled": self.completion_enabled,
                     "favoriteStaticMembers": self.completion_favorites,

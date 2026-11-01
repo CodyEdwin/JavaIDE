@@ -19,7 +19,9 @@ Tauri command backed by the Rust crates.
   `crates/ide-gradle` and the Tooling API sidecar. The bridge is bound to the
   open workspace; opening another folder stops the old bridge and the next
   sync targets the new project.
-- Java language server through `crates/ide-jdtls`: auto-start when the first
+- Java language server through `crates/ide-jdtls`: downloaded automatically
+  (pinned snapshot, SHA-256 checked) when `JAVAIDE_JDTLS_HOME` is unset,
+  auto-start when the first
   `.java` file opens in a trusted workspace, diagnostics (gutter, squiggles,
   problems grouped by file with severity filters and related locations), hover,
   completion, `F12` go-to-definition, `Shift+Alt+F` formatting, and

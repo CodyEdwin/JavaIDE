@@ -7,11 +7,11 @@ The Java intelligence is provided by the
 [Eclipse JDT Language Server (jdtls)](https://github.com/eclipse-jdtls/eclipse.jdt.ls).
 The IDE does not reimplement javac, a Java parser, or a Gradle build engine.
 
-> **Status: Phase 1 core is usable.** The desktop shell edits files, gates
-> Gradle and jdtls behind an explicit trust decision, and can compile, run, and
-> test a Gradle project. Full jdtls breadth (rename, hierarchy, semantic tokens)
-> is Phase 2. The checklist is in
-> [docs/PHASE1_STATUS.md](docs/PHASE1_STATUS.md).
+> **Status: Phase 2 in progress.** Phase 1 editing, trust, and Gradle
+> compile/run/test are in place. Phase 2 has wired rename, references, code
+> actions, signature help, and symbols to a pinned jdtls that the shell
+> downloads on first launch. The checklist is in
+> [docs/PHASE2_STATUS.md](docs/PHASE2_STATUS.md).
 
 ## Run the desktop shell
 
@@ -29,6 +29,12 @@ Gradle bridge is restarted for each workspace, so the panel always describes the
 currently open project. JDKs are taken from `JAVA_HOME`, then common Temurin
 paths, then a scan of `/usr/lib/jvm` and `/Library/Java/JavaVirtualMachines`.
 OpenCode is discovered from the local V2 service and is optional.
+
+If `JAVAIDE_JDTLS_HOME` is unset, the first Java file in a trusted folder
+downloads jdtls `1.64.0-202610301801` (about 48 MB, SHA-256 checked) into the
+user data directory. That build needs JDK 25; the shell uses the newest JDK it
+finds. `F2` renames, `Shift+F12` finds references, and `Ctrl/Cmd+.` lists code
+actions.
 
 The first time a folder opens, the banner asks you to trust it. Until you do,
 the editor still works, and Gradle, jdtls, and OpenCode stay off. **Compile**,
@@ -116,10 +122,12 @@ assumptions. See [ROADMAP.md](docs/ROADMAP.md) for the gates.
 1. **Phase 0:** done. jdtls, the Gradle Tooling API sidecar, and OpenCode V2
    are proven from Rust. See [PHASE0_REPORT.md](docs/PHASE0_REPORT.md).
 2. **Phase 1:** the shell, editor, basic LSP, trust, settings, command palette,
-   and Gradle compile/run/test are in place. Multi-root workspaces and the
-   `ide-ui-api` TypeScript bindings are still ahead. See
+   and Gradle compile/run/test are in place. See
    [PHASE1_STATUS.md](docs/PHASE1_STATUS.md).
-3. **Phase 2:** complete the jdtls feature surface and OpenCode context/permissions.
+3. **Phase 2:** rename, references, code actions, signature help, and symbols
+   are in the shell. Hierarchies, semantic tokens, multi-root import, and
+   OpenCode permissions are not. See
+   [PHASE2_STATUS.md](docs/PHASE2_STATUS.md).
 4. **Phase 3+:** Gradle depth, run configurations, debugger, assistant depth, release.
 
 ## Non-goals for v1

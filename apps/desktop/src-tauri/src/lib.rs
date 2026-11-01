@@ -18,8 +18,9 @@ use ide_gradle::{
     RunTestsRequest, RunTestsResult, TestListing,
 };
 use ide_jdtls::{
-    CompletionCandidate, HoverInfo, JdtlsClient, JdtlsConfig, JdtlsEvent, JdtlsInstallation,
-    SourceLocation, SourcePosition, SourceTextEdit,
+    CompletionCandidate, FileEdits, HoverInfo, JavaCodeAction, JavaSignature, JavaSymbol,
+    JdtlsClient, JdtlsConfig, JdtlsEvent, JdtlsInstallation, PINNED_JDTLS_VERSION, PrepareRename,
+    SourceLocation, SourcePosition, SourceRange, SourceTextEdit, ensure_jdtls,
 };
 use ide_opencode::{CreateSession, DiscoveredService, OpenCodeClient, PromptInput};
 use serde::{Deserialize, Serialize};
@@ -580,6 +581,194 @@ async fn java_definition(
         .map_err(|error| format!("Go to definition failed: {error}"))
 }
 
+/// Requests signature help at a position.
+#[tauri::command]
+async fn java_signature_help(
+    state: State<'_, AppState>,
+    path: String,
+    line: u32,
+    character: u32,
+) -> Result<Vec<JavaSignature>, String> {
+    let file = java_file(&state, &path).await?;
+    let client = java_client(&state).await?;
+    client
+        .signature_help(
+            &file,
+            SourcePosition::new(line, character),
+            Duration::from_secs(8),
+        )
+        .await
+        .map_err(|error| format!("Signature help failed: {error}"))
+}
+
+/// Finds references, optionally including the declaration.
+#[tauri::command]
+async fn java_references(
+    state: State<'_, AppState>,
+    path: String,
+    line: u32,
+    character: u32,
+) -> Result<Vec<SourceLocation>, String> {
+    let file = java_file(&state, &path).await?;
+    let client = java_client(&state).await?;
+    client
+        .references(
+            &file,
+            SourcePosition::new(line, character),
+            true,
+            Duration::from_secs(20),
+        )
+        .await
+        .map_err(|error| format!("Find references failed: {error}"))
+}
+
+/// Finds implementations of the symbol at a position.
+#[tauri::command]
+async fn java_implementation(
+    state: State<'_, AppState>,
+    path: String,
+    line: u32,
+    character: u32,
+) -> Result<Vec<SourceLocation>, String> {
+    let file = java_file(&state, &path).await?;
+    let client = java_client(&state).await?;
+    client
+        .implementation(
+            &file,
+            SourcePosition::new(line, character),
+            Duration::from_secs(20),
+        )
+        .await
+        .map_err(|error| format!("Find implementations failed: {error}"))
+}
+
+/// Finds the type definition of the symbol at a position.
+#[tauri::command]
+async fn java_type_definition(
+    state: State<'_, AppState>,
+    path: String,
+    line: u32,
+    character: u32,
+) -> Result<Vec<SourceLocation>, String> {
+    let file = java_file(&state, &path).await?;
+    let client = java_client(&state).await?;
+    client
+        .type_definition(
+            &file,
+            SourcePosition::new(line, character),
+            Duration::from_secs(15),
+        )
+        .await
+        .map_err(|error| format!("Go to type definition failed: {error}"))
+}
+
+/// Checks whether the symbol at a position can be renamed.
+#[tauri::command]
+async fn java_prepare_rename(
+    state: State<'_, AppState>,
+    path: String,
+    line: u32,
+    character: u32,
+) -> Result<Option<PrepareRename>, String> {
+    let file = java_file(&state, &path).await?;
+    let client = java_client(&state).await?;
+    client
+        .prepare_rename(
+            &file,
+            SourcePosition::new(line, character),
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|error| format!("Prepare rename failed: {error}"))
+}
+
+/// Renames the symbol at a position. Edits are returned and not written.
+#[tauri::command]
+async fn java_rename(
+    state: State<'_, AppState>,
+    path: String,
+    line: u32,
+    character: u32,
+    new_name: String,
+) -> Result<Vec<FileEdits>, String> {
+    let new_name = new_name.trim().to_owned();
+    if new_name.is_empty() || new_name.len() > 256 || new_name.contains('\0') {
+        return Err("Enter a rename target".to_owned());
+    }
+    let file = java_file(&state, &path).await?;
+    let client = java_client(&state).await?;
+    client
+        .rename(
+            &file,
+            SourcePosition::new(line, character),
+            &new_name,
+            Duration::from_secs(30),
+        )
+        .await
+        .map_err(|error| format!("Rename failed: {error}"))
+}
+
+/// Requests code actions for a selection.
+#[tauri::command]
+async fn java_code_actions(
+    state: State<'_, AppState>,
+    path: String,
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+) -> Result<Vec<JavaCodeAction>, String> {
+    let file = java_file(&state, &path).await?;
+    let client = java_client(&state).await?;
+    client
+        .code_actions(
+            &file,
+            SourceRange {
+                start: SourcePosition::new(start_line, start_character),
+                end: SourcePosition::new(end_line, end_character),
+            },
+            Duration::from_secs(20),
+        )
+        .await
+        .map_err(|error| format!("Code actions failed: {error}"))
+}
+
+/// Returns the document outline.
+#[tauri::command]
+async fn java_document_symbols(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Vec<JavaSymbol>, String> {
+    let file = java_file(&state, &path).await?;
+    let client = java_client(&state).await?;
+    client
+        .document_symbols(&file, Duration::from_secs(15))
+        .await
+        .map_err(|error| format!("Document symbols failed: {error}"))
+}
+
+/// Searches symbols in the open workspace.
+#[tauri::command]
+async fn java_workspace_symbols(
+    state: State<'_, AppState>,
+    query: String,
+) -> Result<Vec<JavaSymbol>, String> {
+    let query = query.trim();
+    if query.len() > 200 {
+        return Err("Symbol query is too long".to_owned());
+    }
+    let client = java_client(&state).await?;
+    client
+        .workspace_symbols(query, Duration::from_secs(20))
+        .await
+        .map_err(|error| format!("Workspace symbols failed: {error}"))
+}
+
+async fn java_file(state: &AppState, path: &str) -> Result<std::path::PathBuf, String> {
+    let root = workspace_root(state)?;
+    resolve_workspace_file(&root, path)
+}
+
 /// Formats the document in the active buffer.
 ///
 /// Edits are returned to the caller and applied to the buffer, so formatting
@@ -854,18 +1043,38 @@ async fn start_java(app: &AppHandle, state: &AppState) -> JavaStatus {
     let Ok(root) = workspace_root(state) else {
         return discovery_status();
     };
-    let Some(installation_root) = discover_jdtls_root() else {
-        return set_java_session(
-            app,
-            state,
-            None,
-            "unavailable",
-            "jdtls was not found. Set JAVAIDE_JDTLS_HOME to an extracted jdtls distribution."
-                .to_owned(),
-            None,
-            None,
-        )
-        .await;
+    let installation_root = match discover_jdtls_root() {
+        Some(root) => root,
+        None => {
+            let destination = app_data_dir().join("jdtls").join(PINNED_JDTLS_VERSION);
+            set_java_session(
+                app,
+                state,
+                None,
+                "starting",
+                format!("Downloading jdtls {PINNED_JDTLS_VERSION}…"),
+                None,
+                None,
+            )
+            .await;
+            match ensure_jdtls(&destination).await {
+                Ok(root) => root,
+                Err(error) => {
+                    return set_java_session(
+                        app,
+                        state,
+                        None,
+                        "unavailable",
+                        format!(
+                            "jdtls was not found and could not be downloaded: {error}. Set JAVAIDE_JDTLS_HOME to an extracted distribution."
+                        ),
+                        None,
+                        None,
+                    )
+                    .await;
+                }
+            }
+        }
     };
     let Some(java_home) = find_jdtls_java_home() else {
         return set_java_session(
@@ -1575,16 +1784,28 @@ fn scan_jdk_homes(roots: &[PathBuf]) -> Vec<PathBuf> {
     found
 }
 
+/// Picks the newest JDK at or above `minimum_major`.
+///
+/// The pinned jdtls build needs a current JDK (25 for 1.64). Choosing the
+/// first match would keep an older `JAVA_HOME` and fail OSGi resolution.
 fn find_jdk(minimum_major: u32) -> Option<PathBuf> {
-    jdk_candidates().into_iter().find_map(|home| {
-        if home.join("bin").join("java").is_file()
-            && java_major(&home).is_some_and(|major| major >= minimum_major)
-        {
-            Some(home.canonicalize().unwrap_or(home))
-        } else {
-            None
+    let mut best: Option<(u32, PathBuf)> = None;
+    for home in jdk_candidates() {
+        if !home.join("bin").join("java").is_file() {
+            continue;
         }
-    })
+        let Some(major) = java_major(&home) else {
+            continue;
+        };
+        if major < minimum_major {
+            continue;
+        }
+        let replace = best.as_ref().is_none_or(|(current, _)| major > *current);
+        if replace {
+            best = Some((major, home.canonicalize().unwrap_or(home)));
+        }
+    }
+    best.map(|(_, home)| home)
 }
 
 fn java_major(home: &Path) -> Option<u32> {
@@ -1781,6 +2002,15 @@ pub fn run() {
             java_hover,
             java_completion,
             java_definition,
+            java_signature_help,
+            java_references,
+            java_implementation,
+            java_type_definition,
+            java_prepare_rename,
+            java_rename,
+            java_code_actions,
+            java_document_symbols,
+            java_workspace_symbols,
             java_format_document,
             java_organize_imports,
             java_settings,
