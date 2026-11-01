@@ -44,6 +44,8 @@
 mod client;
 mod config;
 mod features;
+mod intelligence;
+mod provision;
 mod text;
 
 use std::path::PathBuf;
@@ -57,6 +59,10 @@ pub use features::{
     CompletionCandidate, DocumentDiagnostics, HoverInfo, JavaDiagnostic, MAX_COMPLETION_CANDIDATES,
     SourceLocation, SourcePosition, SourceRange, SourceTextEdit,
 };
+pub use intelligence::{
+    FileEdits, JavaCodeAction, JavaSignature, JavaSymbol, PrepareRename, SignatureParameter,
+};
+pub use provision::{PINNED_JDTLS_SHA256, PINNED_JDTLS_VERSION, ensure_jdtls};
 pub use text::{WorkspaceEditOutcome, apply_text_edits, apply_workspace_edit, position_to_offset};
 
 /// Errors from provisioning, launching, or talking to jdtls.
@@ -122,6 +128,17 @@ pub enum JdtlsError {
     /// A workspace edit was invalid or unsupported.
     #[error("workspace edit failed: {0}")]
     WorkspaceEdit(String),
+    /// The jdtls archive could not be downloaded.
+    #[error("jdtls download failed: {0}")]
+    Download(String),
+    /// The downloaded archive did not match the pinned checksum.
+    #[error("jdtls archive checksum mismatch: expected {expected}, got {actual}")]
+    Checksum {
+        /// Expected SHA-256 hex digest.
+        expected: String,
+        /// Digest of the downloaded bytes.
+        actual: String,
+    },
     /// Generic I/O failure.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

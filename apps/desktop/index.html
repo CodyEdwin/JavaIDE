@@ -88,6 +88,10 @@
             <div id="java-problem-summary" class="problem-summary"></div>
             <div id="java-problems" class="problem-list"></div>
             <div class="panel-header sub">
+              <span>References</span>
+            </div>
+            <div id="java-references" class="reference-list"></div>
+            <div class="panel-header sub">
               <span>Server log</span>
               <button id="java-clear-log" class="text-button">Clear</button>
             </div>
@@ -175,6 +179,18 @@
         </main>
       </div>
 
+      <div id="rename-dialog" class="palette hidden" role="dialog" aria-label="Rename">
+        <input id="rename-input" type="text" spellcheck="false" placeholder="New name" />
+        <div id="rename-preview" class="rename-preview"></div>
+        <div class="rename-actions">
+          <button id="rename-apply" class="primary-button" type="button">Apply</button>
+          <button id="rename-cancel" class="text-button" type="button">Cancel</button>
+        </div>
+      </div>
+      <div id="code-actions" class="palette hidden" role="dialog" aria-label="Code actions">
+        <div id="code-action-list"></div>
+      </div>
+      <div id="signature-help" class="signature-help hidden"></div>
       <div id="palette" class="palette hidden" role="dialog" aria-label="Command palette">
         <input id="palette-input" type="text" spellcheck="false" placeholder="Type a command or file name" />
         <div id="palette-list"></div>

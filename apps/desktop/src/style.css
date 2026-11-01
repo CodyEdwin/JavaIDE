@@ -588,6 +588,38 @@ button:hover { background: var(--bg-raised); }
   cursor: pointer;
 }
 .palette-item.active, .palette-item:hover { background: var(--bg-raised); }
+.rename-preview, .reference-list {
+  padding: 6px 12px 8px;
+  color: var(--muted);
+  font-size: 11px;
+  max-height: 160px;
+  overflow: auto;
+}
+.rename-actions { display: flex; gap: 8px; padding: 0 12px 10px; }
+.reference-list { padding: 4px 0; flex: 0 0 auto; max-height: 140px; }
+.reference-item, .code-action-item {
+  padding: 6px 12px;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.reference-item:hover, .code-action-item:hover { background: var(--bg-raised); }
+.code-action-item.disabled { opacity: 0.5; cursor: default; }
+.signature-help {
+  position: fixed;
+  z-index: 30;
+  max-width: 520px;
+  padding: 8px 10px;
+  background: #1c212b;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font: 12px/1.45 var(--font-mono);
+  white-space: pre-wrap;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.signature-help .active-param { color: var(--accent); }
+
 .palette-item span:last-child {
   color: var(--muted);
   font-family: var(--font-mono);

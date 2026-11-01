@@ -91,6 +91,7 @@ let focusedPane = "primary";
 let mirroring = false;
 let paletteMode = "command";
 let paletteIndex = 0;
+let paletteSymbols = [];
 let busyCount = 0;
 let busyLabel = "";
 
@@ -199,6 +200,44 @@ function editorExtensions(path, pane) {
         run: () => {
           organizeJavaImports();
           return true;
+        },
+      },
+      {
+        key: "F2",
+        preventDefault: true,
+        run: () => {
+          startRename();
+          return true;
+        },
+      },
+      {
+        key: "Shift-F12",
+        preventDefault: true,
+        run: () => {
+          findReferences();
+          return true;
+        },
+      },
+      {
+        key: "Mod-.",
+        preventDefault: true,
+        run: () => {
+          showCodeActions();
+          return true;
+        },
+      },
+      {
+        key: "(",
+        run: () => {
+          scheduleSignatureHelp();
+          return false;
+        },
+      },
+      {
+        key: ",",
+        run: () => {
+          scheduleSignatureHelp();
+          return false;
         },
       },
     ]),
@@ -1774,6 +1813,12 @@ const COMMANDS = [
   { title: "Java: Format Document", hint: "Shift+Alt+F", run: () => formatJavaDocument() },
   { title: "Java: Organize Imports", hint: "Shift+Alt+O", run: () => organizeJavaImports() },
   { title: "Java: Go to Definition", hint: "F12", run: () => jumpToDefinition() },
+  { title: "Java: Find References", hint: "Shift+F12", run: () => findReferences() },
+  { title: "Java: Rename Symbol", hint: "F2", run: () => startRename() },
+  { title: "Java: Quick Fix", hint: "Ctrl+.", run: () => showCodeActions() },
+  { title: "Java: Go to Symbol", hint: "outline", run: () => goToDocumentSymbol() },
+  { title: "Java: Go to Implementation", hint: "", run: () => jumpLike("java_implementation", "implementation") },
+  { title: "Java: Go to Type Definition", hint: "", run: () => jumpLike("java_type_definition", "type definition") },
   { title: "View: Split Editor", hint: "", run: () => toggleSplit() },
   { title: "Gradle: Compile", hint: "compileJava", run: () => runNamedTask("compileJava") },
   { title: "Gradle: Run Application", hint: "run", run: () => runNamedTask("run", (task) => task.isRun && task.name === "run") },
@@ -1789,8 +1834,333 @@ const COMMANDS = [
   { title: "View: OpenCode", hint: "", run: () => showPanel("ai") },
 ];
 
-function openPalette(mode) {
+function cursorPosition() {
+  const view = activeView();
+  if (!view) return null;
+  const pos = view.state.selection.main.head;
+  const line = view.state.doc.lineAt(pos);
+  return {
+    view,
+    path: state.active,
+    line: line.number - 1,
+    character: pos - line.from,
+    from: view.state.selection.main.from,
+    to: view.state.selection.main.to,
+    anchorLine: view.state.doc.lineAt(view.state.selection.main.from),
+  };
+}
+
+function scheduleSignatureHelp() {
+  setTimeout(() => {
+    showSignatureHelp().catch(() => {});
+  }, 40);
+}
+
+async function showSignatureHelp() {
+  const cursor = cursorPosition();
+  const box = $("signature-help");
+  if (!cursor || !isJavaPath(cursor.path) || !javaReady() || !workspaceTrusted()) {
+    box.classList.add("hidden");
+    return;
+  }
+  const signatures = await invoke("java_signature_help", {
+    path: cursor.path,
+    line: cursor.line,
+    character: cursor.character,
+  });
+  if (!Array.isArray(signatures) || !signatures.length) {
+    box.classList.add("hidden");
+    return;
+  }
+  box.replaceChildren();
+  for (const signature of signatures.slice(0, 4)) {
+    const row = document.createElement("div");
+    if (signature.active) row.append(document.createTextNode(signature.label));
+    else row.textContent = signature.label;
+    if (signature.active && signature.parameters?.length) {
+      row.textContent = "";
+      const active = signature.parameters.find((parameter) => parameter.active);
+      row.textContent = signature.label;
+      if (active) row.title = active.label;
+    }
+    box.appendChild(row);
+  }
+  const active = signatures.find((signature) => signature.active) || signatures[0];
+  const parameter = active.parameters?.find((item) => item.active);
+  if (parameter) {
+    const note = document.createElement("div");
+    note.className = "active-param";
+    note.textContent = parameter.label;
+    box.appendChild(note);
+  }
+  const coords = cursor.view.coordsAtPos(cursor.view.state.selection.main.head);
+  if (coords) {
+    box.style.left = `${Math.max(8, coords.left)}px`;
+    box.style.top = `${coords.bottom + 6}px`;
+  }
+  box.classList.remove("hidden");
+}
+
+async function findReferences() {
+  const cursor = cursorPosition();
+  if (!cursor || !isJavaPath(cursor.path)) return;
+  if (!javaReady()) {
+    setStatus("Java language server is not ready");
+    return;
+  }
+  showPanel("java");
+  const container = $("java-references");
+  container.textContent = "Searching…";
+  try {
+    const locations = await invoke("java_references", {
+      path: cursor.path,
+      line: cursor.line,
+      character: cursor.character,
+    });
+    renderLocations(container, locations, "No references");
+    setStatus(`${locations.length} reference(s)`);
+  } catch (error) {
+    container.textContent = String(error);
+  }
+}
+
+function renderLocations(container, locations, empty) {
+  container.replaceChildren();
+  if (!locations?.length) {
+    container.textContent = empty;
+    return;
+  }
+  for (const location of locations) {
+    const row = document.createElement("div");
+    row.className = "reference-item";
+    const line = location.range?.start?.line || 0;
+    const character = location.range?.start?.character || 0;
+    row.textContent = `${workspaceRelative(location.path)}:${line + 1}:${character + 1}`;
+    row.addEventListener("click", () => openAbsoluteFile(location.path, line, character));
+    container.appendChild(row);
+  }
+}
+
+let renameTarget = null;
+
+async function startRename() {
+  const cursor = cursorPosition();
+  if (!cursor || !isJavaPath(cursor.path)) return;
+  if (!javaReady()) {
+    setStatus("Java language server is not ready");
+    return;
+  }
+  hideSignature();
+  let placeholder = "";
+  try {
+    const prepared = await invoke("java_prepare_rename", {
+      path: cursor.path,
+      line: cursor.line,
+      character: cursor.character,
+    });
+    if (!prepared) {
+      setStatus("This symbol cannot be renamed");
+      return;
+    }
+    placeholder = prepared.placeholder || "";
+  } catch (error) {
+    showError(String(error));
+    return;
+  }
+  renameTarget = cursor;
+  $("rename-input").value = placeholder;
+  $("rename-preview").textContent = placeholder
+    ? `Rename “${placeholder}”`
+    : "Rename the symbol at the cursor";
+  $("rename-dialog").classList.remove("hidden");
+  $("rename-input").focus();
+  $("rename-input").select();
+}
+
+function cancelRename() {
+  renameTarget = null;
+  $("rename-dialog").classList.add("hidden");
+}
+
+async function applyRename() {
+  const cursor = renameTarget;
+  const newName = $("rename-input").value.trim();
+  if (!cursor || !newName) return;
+  cancelRename();
+  setBusy(`Renaming to ${newName}…`);
+  try {
+    const files = await invoke("java_rename", {
+      path: cursor.path,
+      line: cursor.line,
+      character: cursor.character,
+      newName,
+    });
+    const count = await applyWorkspaceEdits(files);
+    setStatus(count ? `Renamed in ${files.length} file(s)` : "Rename made no changes");
+  } catch (error) {
+    showError(String(error));
+  } finally {
+    clearBusy();
+  }
+}
+
+async function showCodeActions() {
+  const cursor = cursorPosition();
+  if (!cursor || !isJavaPath(cursor.path)) return;
+  if (!javaReady()) {
+    setStatus("Java language server is not ready");
+    return;
+  }
+  const from = cursor.view.state.doc.lineAt(cursor.from);
+  const to = cursor.view.state.doc.lineAt(cursor.to);
+  const actions = await invoke("java_code_actions", {
+    path: cursor.path,
+    startLine: from.number - 1,
+    startCharacter: cursor.from - from.from,
+    endLine: to.number - 1,
+    endCharacter: cursor.to - to.from,
+  });
+  const list = $("code-action-list");
+  list.replaceChildren();
+  if (!actions?.length) {
+    setStatus("No code actions");
+    return;
+  }
+  for (const action of actions) {
+    const row = document.createElement("div");
+    row.className = `code-action-item${action.disabledReason ? " disabled" : ""}`;
+    row.textContent = `${action.preferred ? "★ " : ""}${action.title}`;
+    row.title = action.disabledReason || action.kind || "";
+    if (!action.disabledReason) {
+      row.addEventListener("click", () => applyCodeAction(action));
+    }
+    list.appendChild(row);
+  }
+  $("code-actions").classList.remove("hidden");
+}
+
+async function applyCodeAction(action) {
+  $("code-actions").classList.add("hidden");
+  if (!action.edits?.length) {
+    setStatus(action.disabledReason || "This code action has no text edit");
+    return;
+  }
+  const count = await applyWorkspaceEdits(action.edits);
+  setStatus(count ? action.title : "Code action made no changes");
+}
+
+async function applyWorkspaceEdits(files) {
+  if (!Array.isArray(files) || !files.length) return 0;
+  let count = 0;
+  for (const file of files) {
+    if (!file?.path || !file.path.startsWith(`${state.root}/`)) continue;
+    if (!state.docs.has(file.path)) {
+      const content = await call("read_file", { path: file.path });
+      state.docs.set(file.path, {
+        path: file.path,
+        name: fileName(file.path),
+        content,
+        dirty: false,
+      });
+    }
+    const view = paneForPath(file.path);
+    if (view) {
+      count += applyEditsOnView(view, file.edits || []);
+    } else {
+      const doc = state.docs.get(file.path);
+      const next = applyEditsToString(doc.content, file.edits || []);
+      if (next !== doc.content) {
+        doc.content = next;
+        doc.dirty = true;
+        count += (file.edits || []).length;
+      }
+    }
+    javaScheduleChange(file.path);
+  }
+  renderTabs();
+  showActiveDocument();
+  return count;
+}
+
+function paneForPath(path) {
+  for (const pane of ["primary", "secondary"]) {
+    if (panes[pane].path === path && panes[pane].view && (pane === "primary" || state.split)) {
+      return panes[pane].view;
+    }
+  }
+  return null;
+}
+
+function applyEditsOnView(view, edits) {
+  if (!edits.length) return 0;
+  const doc = view.state.doc;
+  const changes = edits
+    .map((edit) => ({
+      from: offsetAt(doc, edit.range?.start),
+      to: offsetAt(doc, edit.range?.end),
+      insert: edit.newText || "",
+    }))
+    .filter((change) => change.from <= change.to)
+    .sort((left, right) => left.from - right.from);
+  if (!changes.length) return 0;
+  view.dispatch({ changes });
+  return changes.length;
+}
+
+function applyEditsToString(text, edits) {
+  const newline = text.includes("\r\n") ? "\r\n" : "\n";
+  const lines = text.split(/\r?\n/);
+  const starts = [];
+  let offset = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    starts.push(offset);
+    offset += lines[index].length;
+    if (index < lines.length - 1) offset += newline.length;
+  }
+  const at = (position) => {
+    const line = Math.min(Math.max(position?.line || 0, 0), Math.max(lines.length - 1, 0));
+    return (starts[line] || 0) + Math.min(position?.character || 0, lines[line]?.length || 0);
+  };
+  const located = edits
+    .map((edit) => ({
+      from: at(edit.range?.start),
+      to: at(edit.range?.end),
+      insert: edit.newText || "",
+    }))
+    .filter((edit) => edit.from <= edit.to)
+    .sort((left, right) => right.from - left.from);
+  let result = text;
+  for (const edit of located) {
+    result = result.slice(0, edit.from) + edit.insert + result.slice(edit.to);
+  }
+  return result;
+}
+
+function hideSignature() {
+  $("signature-help").classList.add("hidden");
+}
+
+async function goToDocumentSymbol() {
+  const path = state.active;
+  if (!isJavaPath(path) || !javaReady()) {
+    setStatus("Open a Java file with the language server ready");
+    return;
+  }
+  const symbols = await invoke("java_document_symbols", { path });
+  const flat = [];
+  const walk = (items, prefix) => {
+    for (const symbol of items || []) {
+      flat.push({ ...symbol, title: `${prefix}${symbol.name}` });
+      walk(symbol.children, `${prefix}${symbol.name}.`);
+    }
+  };
+  walk(symbols, "");
+  openPalette("symbol", flat);
+}
+
+function openPalette(mode, symbols = []) {
   paletteMode = mode;
+  paletteSymbols = symbols;
   paletteIndex = 0;
   const input = $("palette-input");
   input.value = "";
@@ -1806,6 +2176,21 @@ function closePalette() {
 
 function paletteItems() {
   const query = $("palette-input").value.trim().toLowerCase();
+  if (paletteMode === "symbol") {
+    return paletteSymbols
+      .filter((symbol) => !query || symbol.title.toLowerCase().includes(query) || symbol.name.toLowerCase().includes(query))
+      .slice(0, 50)
+      .map((symbol) => ({
+        title: symbol.title,
+        hint: symbol.kind || "",
+        run: () =>
+          openAbsoluteFile(
+            state.active,
+            symbol.selection?.start?.line || symbol.range?.start?.line || 0,
+            symbol.selection?.start?.character || symbol.range?.start?.character || 0,
+          ),
+      }));
+  }
   if (paletteMode === "file") {
     return state.files
       .filter((entry) => !entry.isDir)
@@ -1846,6 +2231,30 @@ function runPaletteSelection() {
   const item = paletteItems()[paletteIndex];
   closePalette();
   if (item) item.run();
+}
+
+async function jumpLike(command, label) {
+  const cursor = cursorPosition();
+  if (!cursor || !isJavaPath(cursor.path) || !javaReady()) {
+    setStatus("Java language server is not ready");
+    return;
+  }
+  const locations = await invoke(command, {
+    path: cursor.path,
+    line: cursor.line,
+    character: cursor.character,
+  });
+  if (!locations?.length) {
+    setStatus(`No ${label} found`);
+    return;
+  }
+  const target = locations[0];
+  await openAbsoluteFile(
+    target.path,
+    target.range?.start?.line || 0,
+    target.range?.start?.character || 0,
+  );
+  if (locations.length > 1) setStatus(`${locations.length} ${label} results; opened the first`);
 }
 
 async function openFolder() {
@@ -1905,6 +2314,14 @@ async function boot() {
   });
   $("java-settings-save").addEventListener("click", saveJavaSettings);
   $("java-show-debug").addEventListener("click", showDebugLog);
+  $("rename-apply").addEventListener("click", applyRename);
+  $("rename-cancel").addEventListener("click", cancelRename);
+  $("rename-input").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      applyRename();
+    }
+  });
   const problemFilter = $("java-problem-filter");
   problemFilter.value = state.java.problemFilter;
   problemFilter.addEventListener("change", () => {
@@ -1955,10 +2372,23 @@ async function boot() {
 
   document.addEventListener("keydown", (event) => {
     const paletteOpen = !$("palette").classList.contains("hidden");
-    if (event.key === "Escape" && paletteOpen) {
-      event.preventDefault();
-      closePalette();
-      return;
+    if (event.key === "Escape") {
+      if (!$("rename-dialog").classList.contains("hidden")) {
+        event.preventDefault();
+        cancelRename();
+        return;
+      }
+      if (!$("code-actions").classList.contains("hidden")) {
+        event.preventDefault();
+        $("code-actions").classList.add("hidden");
+        return;
+      }
+      hideSignature();
+      if (paletteOpen) {
+        event.preventDefault();
+        closePalette();
+        return;
+      }
     }
     if (paletteOpen && event.key === "ArrowDown") {
       event.preventDefault();
