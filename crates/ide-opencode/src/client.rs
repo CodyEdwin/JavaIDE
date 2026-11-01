@@ -264,6 +264,27 @@ impl PromptInput {
     }
 }
 
+/// A pending permission request from `GET /api/permission/request`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionRequest {
+    /// Request id used to reply.
+    #[serde(alias = "requestID")]
+    pub id: String,
+    /// Session that is waiting.
+    #[serde(default, alias = "sessionID")]
+    pub session_id: String,
+    /// Tool or action name.
+    #[serde(default)]
+    pub action: String,
+    /// Human-readable prompt.
+    #[serde(default)]
+    pub message: String,
+    /// Paths or patterns OpenCode wants to touch.
+    #[serde(default)]
+    pub resources: Value,
+}
+
 /// A reply to a pending permission request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -502,6 +523,21 @@ impl OpenCodeClient {
         ensure_empty(request.send().await?).await
     }
 
+    /// Lists permission requests that are still waiting for a reply.
+    ///
+    /// SSE has no replay, so callers refetch this after every reconnect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an HTTP or transport error. Entries that are not permission
+    /// objects are skipped.
+    pub async fn list_permission_requests(&self) -> Result<Vec<PermissionRequest>, OpenCodeError> {
+        let url = endpoint(&self.base_url, &["api", "permission", "request"])?;
+        let request = authorize(self.http.get(url), &self.credentials);
+        let value: Value = decode_json(request.send().await?).await?;
+        Ok(parse_permission_requests(value))
+    }
+
     /// Fetches structured per-file diffs for one turn.
     ///
     /// # Errors
@@ -618,6 +654,25 @@ fn endpoint(base: &Url, segments: &[&str]) -> Result<Url, OpenCodeError> {
     Ok(url)
 }
 
+pub(crate) fn parse_permission_requests(value: Value) -> Vec<PermissionRequest> {
+    let list = match value {
+        Value::Array(_) => value,
+        Value::Object(map) => map
+            .get("data")
+            .or_else(|| map.get("requests"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        _ => Value::Null,
+    };
+    let Value::Array(items) = list else {
+        return Vec::new();
+    };
+    items
+        .into_iter()
+        .filter_map(|item| serde_json::from_value(item).ok())
+        .collect()
+}
+
 fn absolute_directory(directory: &Path) -> Result<String, OpenCodeError> {
     if !directory.is_absolute() {
         return Err(OpenCodeError::InvalidArgument(format!(
@@ -708,6 +763,24 @@ mod tests {
     use super::*;
 
     const INFO: &str = r#"{"version":"2.1.4","pid":99,"urls":["http://127.0.0.1"],"paths":{"tmp":"/tmp/opencode"},"capabilities":{"persistentPty":true}}"#;
+
+    #[test]
+    fn permission_requests_accept_opencode_ids() {
+        let wrapped = json!({
+            "data": [{
+                "id": "req-1",
+                "sessionID": "ses-1",
+                "action": "bash",
+                "message": "run tests",
+                "resources": ["src"]
+            }, { "noise": true }]
+        });
+        let requests = parse_permission_requests(wrapped);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, "req-1");
+        assert_eq!(requests[0].session_id, "ses-1");
+        assert_eq!(requests[0].action, "bash");
+    }
 
     async fn serve_once(
         listener: TcpListener,

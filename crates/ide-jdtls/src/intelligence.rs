@@ -83,6 +83,9 @@ pub struct JavaSymbol {
     pub selection: SourceRange,
     /// File that contains the symbol. Set for workspace symbols.
     pub path: Option<PathBuf>,
+    /// `jdt://` URI when the symbol is a decompiled class file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
     /// Nested symbols. Empty for workspace-symbol results.
     pub children: Vec<JavaSymbol>,
 }
@@ -105,8 +108,8 @@ pub struct JavaCodeAction {
 
 /// Converts a workspace edit into per-file buffer edits.
 ///
-/// Only plain `changes` are read. The client advertises `documentChanges:
-/// false`, so jdtls is asked not to send resource operations.
+/// Only plain `changes` are read. Versioned `documentChanges` are planned by
+/// [`crate::text::plan_workspace_edit`]. Resource operations are rejected.
 // `Uri` caches a parse in a `Cell`. Hash and equality ignore that cache.
 #[allow(clippy::mutable_key_type)]
 pub(crate) fn workspace_file_edits(edit: &WorkspaceEdit) -> Vec<FileEdits> {
@@ -221,6 +224,7 @@ fn nested_symbol(symbol: DocumentSymbol) -> JavaSymbol {
         range: symbol.range.into(),
         selection: symbol.selection_range.into(),
         path: None,
+        uri: None,
         children: symbol
             .children
             .unwrap_or_default()
@@ -232,13 +236,15 @@ fn nested_symbol(symbol: DocumentSymbol) -> JavaSymbol {
 
 fn flat_symbol(symbol: SymbolInformation) -> Option<JavaSymbol> {
     let location = location_view(symbol.location)?;
+    let (path, uri, range) = symbol_place(location);
     Some(JavaSymbol {
         name: symbol.name,
         kind: symbol_kind_name(symbol.kind).to_owned(),
         detail: symbol.container_name,
-        range: location.range,
-        selection: location.range,
-        path: Some(location.path),
+        range,
+        selection: range,
+        path,
+        uri,
         children: Vec::new(),
     })
 }
@@ -255,20 +261,17 @@ pub(crate) fn workspace_symbols(response: WorkspaceSymbolResponse) -> Vec<JavaSy
 }
 
 fn workspace_symbol(symbol: WorkspaceSymbol) -> Option<JavaSymbol> {
-    let (path, range) = match symbol.location {
+    let (path, uri, range) = match symbol.location {
         OneOf::Left(location) => {
             let view = location_view(location)?;
-            (view.path, view.range)
+            symbol_place(view)
         }
         OneOf::Right(location) => {
-            let path = uri_to_path(&location.uri).ok()?;
-            (
-                path,
-                SourceRange {
-                    start: crate::features::SourcePosition::new(0, 0),
-                    end: crate::features::SourcePosition::new(0, 0),
-                },
-            )
+            let view = location_view(lsp_types::Location {
+                uri: location.uri,
+                range: lsp_types::Range::default(),
+            })?;
+            symbol_place(view)
         }
     };
     Some(JavaSymbol {
@@ -277,9 +280,19 @@ fn workspace_symbol(symbol: WorkspaceSymbol) -> Option<JavaSymbol> {
         detail: symbol.container_name,
         range,
         selection: range,
-        path: Some(path),
+        path,
+        uri,
         children: Vec::new(),
     })
+}
+
+fn symbol_place(location: SourceLocation) -> (Option<PathBuf>, Option<String>, SourceRange) {
+    let path = if location.path.as_os_str().is_empty() {
+        None
+    } else {
+        Some(location.path)
+    };
+    (path, location.uri, location.range)
 }
 
 pub(crate) fn code_actions(actions: Vec<CodeActionOrCommand>) -> Vec<JavaCodeAction> {
@@ -326,7 +339,7 @@ fn documentation_plain(documentation: lsp_types::Documentation) -> String {
     }
 }
 
-fn symbol_kind_name(kind: SymbolKind) -> &'static str {
+pub(crate) fn symbol_kind_name(kind: SymbolKind) -> &'static str {
     if kind == SymbolKind::FILE {
         "file"
     } else if kind == SymbolKind::MODULE {

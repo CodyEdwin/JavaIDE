@@ -42,8 +42,6 @@ use crate::intelligence::{
     document_symbols, prepare_rename_view, reference_locations, signature_help_view,
     workspace_file_edits, workspace_symbols,
 };
-use crate::text::apply_workspace_edit;
-
 const EVENT_CAPACITY: usize = 1024;
 const INCOMING_CAPACITY: usize = 256;
 const LOG_LINE_LIMIT: usize = 4096;
@@ -98,6 +96,18 @@ pub enum JdtlsEvent {
         /// Exit status, if it could be collected.
         status: Option<ExitStatus>,
     },
+    /// A validated `workspace/applyEdit` for the editor to apply to buffers.
+    ///
+    /// The adapter does not write these edits to disk.
+    WorkspaceEdit {
+        /// Per-file edits.
+        files: Vec<crate::intelligence::FileEdits>,
+    },
+    /// jdtls asked for an edit that failed the version or overlap checks.
+    WorkspaceEditRejected {
+        /// Why the edit was not applied.
+        reason: String,
+    },
 }
 
 impl JdtlsEvent {
@@ -138,6 +148,12 @@ impl fmt::Display for JdtlsEvent {
                 None => formatter.write_str("closed"),
             },
             Self::Exited { status } => write!(formatter, "exited ({status:?})"),
+            Self::WorkspaceEdit { files } => {
+                write!(formatter, "workspace edit ({} files)", files.len())
+            }
+            Self::WorkspaceEditRejected { reason } => {
+                write!(formatter, "workspace edit rejected: {reason}")
+            }
         }
     }
 }
@@ -148,13 +164,19 @@ impl fmt::Display for JdtlsEvent {
 /// not `Clone`; wrap it in the application's supervisor if shared access is
 /// needed.
 pub struct JdtlsClient {
-    peer: RpcPeer,
+    pub(crate) peer: RpcPeer,
     events: broadcast::Sender<JdtlsEvent>,
     ready: watch::Receiver<bool>,
     exit: watch::Receiver<Option<ExitStatus>>,
     kill: Mutex<Option<oneshot::Sender<()>>>,
     settings: Arc<RwLock<Value>>,
     diagnostics: Arc<Mutex<HashMap<String, PublishDiagnosticsParams>>>,
+    /// Open document URI → editor version, shared with the request pump.
+    versions: Arc<Mutex<HashMap<String, i32>>>,
+    /// Workspace folder URI and display name.
+    pub(crate) folders: Arc<Mutex<Vec<(String, String)>>>,
+    /// Token type names from the server's semantic-token legend.
+    pub(crate) semantic_legend: Arc<Mutex<Vec<String>>>,
     config: JdtlsConfig,
     workspace_root: PathBuf,
     pid: Option<u32>,
@@ -191,7 +213,7 @@ impl JdtlsClient {
         }
         if !config.skip_java_version_check {
             let major = probe_java_major(&java).await?;
-            if major < 21 {
+            if major < crate::config::JDTLS_MIN_JAVA {
                 return Err(JdtlsError::JavaTooOld { found: major });
             }
         }
@@ -263,6 +285,9 @@ impl JdtlsClient {
         let (kill_sender, kill_receiver) = oneshot::channel();
         let settings = Arc::new(RwLock::new(config.settings.clone()));
         let diagnostics = Arc::new(Mutex::new(HashMap::new()));
+        let versions = Arc::new(Mutex::new(HashMap::new()));
+        let folders = Arc::new(Mutex::new(Vec::new()));
+        let semantic_legend = Arc::new(Mutex::new(Vec::new()));
 
         spawn_process_monitor(child, kill_receiver, exit_sender, events.clone());
 
@@ -270,15 +295,19 @@ impl JdtlsClient {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "workspace".to_owned());
+        folders
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((root_uri.as_str().to_owned(), folder_name));
         let context = PumpContext {
             peer: peer.clone(),
             settings: Arc::clone(&settings),
             diagnostics: Arc::clone(&diagnostics),
+            versions: Arc::clone(&versions),
+            folders: Arc::clone(&folders),
             ready: ready_sender,
             events: events.clone(),
             workspace_root: workspace_root.clone(),
-            root_uri,
-            folder_name,
         };
         tokio::spawn(pump(context, incoming));
 
@@ -290,6 +319,9 @@ impl JdtlsClient {
             kill: Mutex::new(Some(kill_sender)),
             settings,
             diagnostics,
+            versions,
+            folders,
+            semantic_legend,
             config,
             workspace_root,
             pid,
@@ -344,8 +376,27 @@ impl JdtlsClient {
             .peer
             .request_with_timeout("initialize", Some(value), self.config.initialize_timeout)
             .await?;
-        serde_json::from_value(response)
-            .map_err(|error| JdtlsError::Protocol(format!("invalid initialize response: {error}")))
+        let result: InitializeResult = serde_json::from_value(response).map_err(|error| {
+            JdtlsError::Protocol(format!("invalid initialize response: {error}"))
+        })?;
+        if let Some(provider) = &result.capabilities.semantic_tokens_provider {
+            let token_types = match provider {
+                lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(options) => {
+                    options.legend.token_types.clone()
+                }
+                lsp_types::SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
+                    options,
+                ) => options.semantic_tokens_options.legend.token_types.clone(),
+            };
+            *self
+                .semantic_legend
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = token_types
+                .into_iter()
+                .map(|token| token.as_str().to_owned())
+                .collect();
+        }
+        Ok(result)
     }
 
     /// Sends the `initialized` notification.
@@ -461,6 +512,10 @@ impl JdtlsClient {
         self.peer
             .notify("textDocument/didOpen", Some(serde_json::to_value(params)?))
             .await?;
+        self.versions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(uri.as_str().to_owned(), version);
         Ok(uri)
     }
 
@@ -492,6 +547,10 @@ impl JdtlsClient {
         self.peer
             .notify("textDocument/didClose", Some(serde_json::to_value(params)?))
             .await?;
+        self.versions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(uri.as_str());
         Ok(())
     }
 
@@ -533,6 +592,10 @@ impl JdtlsClient {
                 Some(serde_json::to_value(params)?),
             )
             .await?;
+        self.versions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(uri.as_str().to_owned(), version);
         Ok(uri)
     }
 
@@ -963,7 +1026,7 @@ impl JdtlsClient {
         Ok(resolved)
     }
 
-    async fn lsp<T: DeserializeOwned>(
+    pub(crate) async fn lsp<T: DeserializeOwned>(
         &self,
         method: &str,
         params: impl serde::Serialize,
@@ -1280,7 +1343,7 @@ fn lsp_range(range: crate::features::SourceRange) -> Range {
     }
 }
 
-fn text_document_position(
+pub(crate) fn text_document_position(
     path: &std::path::Path,
     position: SourcePosition,
 ) -> Result<TextDocumentPositionParams, JdtlsError> {
@@ -1349,11 +1412,11 @@ struct PumpContext {
     peer: RpcPeer,
     settings: Arc<RwLock<Value>>,
     diagnostics: Arc<Mutex<HashMap<String, PublishDiagnosticsParams>>>,
+    versions: Arc<Mutex<HashMap<String, i32>>>,
+    folders: Arc<Mutex<Vec<(String, String)>>>,
     ready: watch::Sender<bool>,
     events: broadcast::Sender<JdtlsEvent>,
     workspace_root: PathBuf,
-    root_uri: Uri,
-    folder_name: String,
 }
 
 async fn pump(context: PumpContext, mut incoming: mpsc::Receiver<Incoming>) {
@@ -1504,36 +1567,64 @@ async fn handle_server_request(
                 .await;
                 return;
             };
-            let outcome = serde_json::from_value::<ApplyWorkspaceEditParams>(params)
-                .map_err(|error| JdtlsError::Protocol(error.to_string()))
-                .and_then(|params| apply_workspace_edit(&context.workspace_root, &params.edit));
+            let parsed = serde_json::from_value::<ApplyWorkspaceEditParams>(params)
+                .map_err(|error| JdtlsError::Protocol(error.to_string()));
+            let versions = context
+                .versions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            let outcome = parsed.and_then(|params| {
+                let mut roots = vec![context.workspace_root.clone()];
+                let folders = context
+                    .folders
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                for (uri, _) in folders {
+                    if let Ok(parsed_uri) = uri.parse::<Uri>()
+                        && let Ok(path) = crate::config::uri_to_path(&parsed_uri)
+                        && path.is_dir()
+                    {
+                        roots.push(path);
+                    }
+                }
+                crate::text::plan_workspace_edit_roots(
+                    &roots,
+                    &params.edit,
+                    &versions.into_iter().collect(),
+                )
+            });
             match outcome {
-                Ok(outcome) => {
-                    tracing::debug!(
-                        files = outcome.files_changed,
-                        edits = outcome.edits_applied,
-                        "applied workspace edit from jdtls"
-                    );
+                Ok(files) => {
+                    tracing::debug!(count = files.len(), "accepted workspace edit from jdtls");
+                    let _ = context.events.send(JdtlsEvent::WorkspaceEdit { files });
                     respond(context, id, json!({ "applied": true })).await;
                 }
                 Err(error) => {
                     tracing::warn!(%error, "rejected workspace edit from jdtls");
+                    let reason = error.to_string();
+                    let _ = context.events.send(JdtlsEvent::WorkspaceEditRejected {
+                        reason: reason.clone(),
+                    });
                     respond(
                         context,
                         id,
-                        json!({ "applied": false, "failureReason": error.to_string() }),
+                        json!({ "applied": false, "failureReason": reason }),
                     )
                     .await;
                 }
             }
         }
         "workspace/workspaceFolders" => {
-            respond(
-                context,
-                id,
-                json!([{ "uri": context.root_uri.as_str(), "name": context.folder_name }]),
-            )
-            .await;
+            let folders = context
+                .folders
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .map(|(uri, name)| json!({ "uri": uri, "name": name }))
+                .collect::<Vec<_>>();
+            respond(context, id, Value::Array(folders)).await;
         }
         "window/workDoneProgress/create"
         | "client/registerCapability"

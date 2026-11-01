@@ -4,20 +4,43 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use lsp_types::{
-    ClientCapabilities, ClientInfo, CodeActionCapabilityResolveSupport,
-    CodeActionClientCapabilities, CodeActionKindLiteralSupport, CodeActionLiteralSupport,
-    DocumentFormattingClientCapabilities, DocumentRangeFormattingClientCapabilities,
-    DocumentSymbolClientCapabilities, FailureHandlingKind, GeneralClientCapabilities,
-    GotoCapability, HoverClientCapabilities, InitializeParams, MarkupKind, PositionEncodingKind,
-    PublishDiagnosticsClientCapabilities, RenameClientCapabilities,
-    SignatureHelpClientCapabilities, SignatureInformationSettings, TextDocumentClientCapabilities,
-    TextDocumentSyncClientCapabilities, Uri, WindowClientCapabilities, WorkspaceClientCapabilities,
+    CallHierarchyClientCapabilities, ClientCapabilities, ClientInfo,
+    CodeActionCapabilityResolveSupport, CodeActionClientCapabilities, CodeActionKindLiteralSupport,
+    CodeActionLiteralSupport, CodeLensClientCapabilities, DocumentFormattingClientCapabilities,
+    DocumentRangeFormattingClientCapabilities, DocumentSymbolClientCapabilities,
+    FailureHandlingKind, FoldingRangeClientCapabilities, GeneralClientCapabilities, GotoCapability,
+    HoverClientCapabilities, InitializeParams, InlayHintClientCapabilities, MarkupKind,
+    PositionEncodingKind, PublishDiagnosticsClientCapabilities, RenameClientCapabilities,
+    SelectionRangeClientCapabilities, SemanticTokenModifier, SemanticTokenType,
+    SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
+    SemanticTokensFullOptions, SignatureHelpClientCapabilities, SignatureInformationSettings,
+    TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities, TokenFormat,
+    TypeHierarchyClientCapabilities, Uri, WindowClientCapabilities, WorkspaceClientCapabilities,
     WorkspaceEditClientCapabilities, WorkspaceFolder, WorkspaceSymbolClientCapabilities,
 };
 use serde_json::{Map, Value, json};
 use url::Url;
 
 use crate::JdtlsError;
+
+/// Minimum Java major for the pinned jdtls snapshot.
+///
+/// The 1.64 OSGi bundles require JavaSE 25. JDK 21 starts the JVM and then
+/// fails to resolve the application.
+pub const JDTLS_MIN_JAVA: u32 = 25;
+
+/// Preferences jdtls leaves disabled unless the client sends them.
+fn default_java_settings() -> Value {
+    json!({
+        "java": {
+            "signatureHelp": { "enabled": true },
+            "import": { "generatesMetadataFilesAtProjectRoot": false },
+            "inlayHints": { "parameterNames": { "enabled": "all" } },
+            "referencesCodeLens": { "enabled": true },
+            "implementationsCodeLens": { "enabled": true }
+        }
+    })
+}
 
 /// A validated jdtls distribution layout.
 #[derive(Debug, Clone)]
@@ -126,8 +149,9 @@ impl JdtlsConfig {
             workspace_root: workspace_root.into(),
             bundles: Vec::new(),
             vm_args: Vec::new(),
-            // jdtls leaves signature help off unless the client asks for it.
-            settings: json!({ "java": { "signatureHelp": { "enabled": true } } }),
+            // jdtls leaves signature help, inlay hints, and code lenses off
+            // unless the client asks for them.
+            settings: default_java_settings(),
             extra_args: Vec::new(),
             log_level: "WARN".to_owned(),
             initialize_timeout: std::time::Duration::from_secs(120),
@@ -260,10 +284,9 @@ fn client_capabilities() -> ClientCapabilities {
     let workspace = WorkspaceClientCapabilities {
         apply_edit: Some(true),
         workspace_edit: Some(WorkspaceEditClientCapabilities {
-            // Phase 0 applies plain `changes` edits. Resource operations and
-            // documentChanges are advertised as unsupported so jdtls does not
-            // send operations the client cannot apply atomically yet.
-            document_changes: Some(false),
+            // Versioned `documentChanges` are planned and applied to buffers.
+            // Resource operations stay unsupported and are rejected.
+            document_changes: Some(true),
             resource_operations: None,
             failure_handling: Some(FailureHandlingKind::Abort),
             normalizes_line_endings: Some(false),
@@ -360,6 +383,29 @@ fn client_capabilities() -> ClientCapabilities {
             }),
             ..CodeActionClientCapabilities::default()
         }),
+        code_lens: Some(CodeLensClientCapabilities {
+            dynamic_registration: Some(false),
+        }),
+        folding_range: Some(FoldingRangeClientCapabilities {
+            dynamic_registration: Some(false),
+            range_limit: Some(5_000),
+            line_folding_only: Some(true),
+            ..FoldingRangeClientCapabilities::default()
+        }),
+        selection_range: Some(SelectionRangeClientCapabilities {
+            dynamic_registration: Some(false),
+        }),
+        call_hierarchy: Some(CallHierarchyClientCapabilities {
+            dynamic_registration: Some(false),
+        }),
+        type_hierarchy: Some(TypeHierarchyClientCapabilities {
+            dynamic_registration: Some(false),
+        }),
+        semantic_tokens: Some(semantic_token_capabilities()),
+        inlay_hint: Some(InlayHintClientCapabilities {
+            dynamic_registration: Some(false),
+            resolve_support: None,
+        }),
         ..TextDocumentClientCapabilities::default()
     };
 
@@ -379,6 +425,51 @@ fn client_capabilities() -> ClientCapabilities {
         window: Some(window),
         general: Some(general),
         ..ClientCapabilities::default()
+    }
+}
+
+fn semantic_token_capabilities() -> SemanticTokensClientCapabilities {
+    SemanticTokensClientCapabilities {
+        dynamic_registration: Some(false),
+        requests: SemanticTokensClientCapabilitiesRequests {
+            range: Some(false),
+            full: Some(SemanticTokensFullOptions::Bool(true)),
+        },
+        token_types: vec![
+            SemanticTokenType::NAMESPACE,
+            SemanticTokenType::TYPE,
+            SemanticTokenType::CLASS,
+            SemanticTokenType::ENUM,
+            SemanticTokenType::INTERFACE,
+            SemanticTokenType::TYPE_PARAMETER,
+            SemanticTokenType::PARAMETER,
+            SemanticTokenType::VARIABLE,
+            SemanticTokenType::PROPERTY,
+            SemanticTokenType::ENUM_MEMBER,
+            SemanticTokenType::FUNCTION,
+            SemanticTokenType::METHOD,
+            SemanticTokenType::KEYWORD,
+            SemanticTokenType::MODIFIER,
+            SemanticTokenType::COMMENT,
+            SemanticTokenType::STRING,
+            SemanticTokenType::NUMBER,
+            SemanticTokenType::OPERATOR,
+        ],
+        token_modifiers: vec![
+            SemanticTokenModifier::DECLARATION,
+            SemanticTokenModifier::DEFINITION,
+            SemanticTokenModifier::READONLY,
+            SemanticTokenModifier::STATIC,
+            SemanticTokenModifier::DEPRECATED,
+            SemanticTokenModifier::ABSTRACT,
+            SemanticTokenModifier::DOCUMENTATION,
+            SemanticTokenModifier::DEFAULT_LIBRARY,
+        ],
+        formats: vec![TokenFormat::RELATIVE],
+        overlapping_token_support: Some(false),
+        multiline_token_support: Some(false),
+        server_cancel_support: None,
+        augments_syntax_tokens: Some(true),
     }
 }
 

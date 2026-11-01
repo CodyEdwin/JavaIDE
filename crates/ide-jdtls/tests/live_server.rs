@@ -6,7 +6,7 @@
 //!
 //! ```sh
 //! JAVAIDE_JDTLS_HOME=/path/to/jdtls \
-//! JAVAIDE_JDTLS_JAVA_HOME=/path/to/jdk-21 \
+//! JAVAIDE_JDTLS_JAVA_HOME=/path/to/jdk-25 \
 //! cargo test -p ide-jdtls --test live_server -- --ignored --nocapture
 //! ```
 //!
@@ -299,6 +299,148 @@ async fn jdtls_serves_diagnostics_hover_completion_and_definition() {
         actions.iter().any(|action| !action.title.is_empty()),
         "expected a code action for the broken file, got {actions:?}"
     );
+
+    let folds = client
+        .folding_ranges(&file, REQUEST_TIMEOUT)
+        .await
+        .expect("folding ranges");
+    assert!(!folds.is_empty(), "expected at least one fold");
+
+    let tokens = client
+        .semantic_tokens(&file, REQUEST_TIMEOUT)
+        .await
+        .expect("semantic tokens");
+    assert!(
+        tokens.iter().any(|token| token.length > 0),
+        "semantic tokens were empty: {tokens:?}"
+    );
+
+    let end_line = text.lines().count().saturating_sub(1) as u32;
+    let hints = client
+        .inlay_hints(
+            &file,
+            ide_jdtls::SourceRange {
+                start: SourcePosition::new(0, 0),
+                end: SourcePosition::new(end_line, 200),
+            },
+            REQUEST_TIMEOUT,
+        )
+        .await
+        .expect("inlay hints");
+    assert!(
+        hints.iter().any(|hint| !hint.label.is_empty()),
+        "expected parameter-name hints, got {hints:?}"
+    );
+
+    let selections = client
+        .selection_ranges(&file, hover_position, REQUEST_TIMEOUT)
+        .await
+        .expect("selection ranges");
+    assert!(!selections.is_empty(), "expected selection ranges");
+
+    let (main_line, main_character) = position_of(&text, "void main").expect("main");
+    let outgoing = client
+        .hierarchy(
+            &file,
+            SourcePosition::new(main_line, main_character + 5),
+            "outgoing",
+            REQUEST_TIMEOUT,
+        )
+        .await
+        .expect("outgoing calls");
+    assert!(
+        outgoing
+            .iter()
+            .any(|node| node.name.contains("add") || node.name.contains("println")),
+        "outgoing calls missing add/println: {outgoing:?}"
+    );
+    let incoming = client
+        .hierarchy(&file, hover_position, "incoming", REQUEST_TIMEOUT)
+        .await
+        .expect("incoming calls");
+    assert!(
+        incoming.iter().any(|node| node.name.contains("main")),
+        "incoming calls missing main: {incoming:?}"
+    );
+
+    let types_path = project.join("src/main/java/com/example/Types.java");
+    let types_source =
+        "package com.example;\ninterface Named {}\nclass Person implements Named {}\n";
+    std::fs::write(&types_path, types_source).expect("write types");
+    client
+        .open_document(&types_path, types_source, 1)
+        .await
+        .expect("open types");
+    let (person_line, person_character) =
+        position_of(types_source, "class Person").expect("Person");
+    let person = SourcePosition::new(person_line, person_character + "class ".len() as u32);
+    let mut supertypes = Vec::new();
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    while Instant::now() < deadline && supertypes.is_empty() {
+        if let Ok(found) = client
+            .hierarchy(&types_path, person, "supertypes", REQUEST_TIMEOUT)
+            .await
+            && found.iter().any(|node| node.name.contains("Named"))
+        {
+            supertypes = found;
+            break;
+        }
+        tokio::time::sleep(RETRY_INTERVAL).await;
+    }
+    assert!(
+        supertypes.iter().any(|node| node.name.contains("Named")),
+        "supertypes of Person missing Named: {supertypes:?}"
+    );
+
+    // This plain project resolves user symbols, but JDK definitions come back
+    // empty until a source attachment exists. A `jdt://` result must decompile;
+    // a direct class-file read must not be a protocol error.
+    let (system_line, system_character) = position_of(&text, "System.out").expect("System");
+    let system_locations = client
+        .definition(
+            &file,
+            SourcePosition::new(system_line, system_character + 1),
+            REQUEST_TIMEOUT,
+        )
+        .await
+        .expect("definition of System");
+    if let Some(uri) = system_locations
+        .iter()
+        .find_map(|location| location.uri.clone().filter(|uri| uri.starts_with("jdt:")))
+    {
+        let contents = client
+            .class_file_contents(&uri, REQUEST_TIMEOUT)
+            .await
+            .expect("class file contents");
+        assert!(
+            !contents.trim().is_empty(),
+            "empty decompiled document {uri}"
+        );
+    } else {
+        client
+            .class_file_contents(
+                "jdt://contents/java.base/java/lang/System.class",
+                REQUEST_TIMEOUT,
+            )
+            .await
+            .expect("class file request");
+    }
+
+    let lenses = client
+        .code_lens(&file, REQUEST_TIMEOUT)
+        .await
+        .expect("code lens");
+    assert!(
+        lenses.iter().any(|lens| !lens.title.is_empty()),
+        "expected a code lens, got {lenses:?}"
+    );
+
+    let extra = temporary.path().join("extra-root");
+    std::fs::create_dir_all(&extra).expect("extra root");
+    client
+        .add_workspace_folder(&extra)
+        .await
+        .expect("add workspace folder");
 
     client
         .shutdown(Duration::from_secs(15))

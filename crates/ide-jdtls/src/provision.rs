@@ -22,6 +22,18 @@ pub const PINNED_JDTLS_SHA256: &str =
 const PINNED_JDTLS_URL: &str =
     "https://download.eclipse.org/jdtls/snapshots/jdt-language-server-1.64.0-202610301801.tar.gz";
 
+/// Pinned Temurin build used when the machine has no JDK 25.
+///
+/// Linux x86_64 only. Other platforms get a message that names the requirement
+/// and the `JAVAIDE_JDTLS_JAVA_HOME` override.
+pub const PINNED_JDK_VERSION: &str = "25.0.5+8";
+
+/// SHA-256 of the pinned Temurin archive.
+pub const PINNED_JDK_SHA256: &str =
+    "68982529869257d0ee6b824ec5aa270ff8b118bb438670da0b97ebdab178d7fb";
+
+const PINNED_JDK_URL: &str = "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_x64_linux_hotspot_25.0.5_8.tar.gz";
+
 /// Returns `destination` when it is already a jdtls layout, otherwise downloads
 /// the pinned archive, checks its SHA-256, and extracts it there.
 ///
@@ -87,19 +99,123 @@ pub async fn ensure_jdtls(destination: &Path) -> Result<PathBuf, JdtlsError> {
     Ok(destination.to_path_buf())
 }
 
+/// Returns a JDK 25 home at `destination`, downloading Temurin when it is missing.
+///
+/// A directory that already contains `bin/java`, or a single extracted child
+/// that does, is reused. The download runs only on Linux x86_64.
+///
+/// # Errors
+///
+/// Returns [`JdtlsError::Download`] or [`JdtlsError::Checksum`] when the archive
+/// cannot be fetched or does not match the pin, and
+/// [`JdtlsError::Installation`] on platforms that do not have an automatic
+/// runtime.
+pub async fn ensure_jdk(destination: &Path) -> Result<PathBuf, JdtlsError> {
+    if let Some(home) = locate_jdk(destination) {
+        return Ok(home);
+    }
+    provision_jdk(destination).await
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+async fn provision_jdk(destination: &Path) -> Result<PathBuf, JdtlsError> {
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| JdtlsError::PathIo {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let partial = partial_dir(destination);
+    if partial.exists() {
+        std::fs::remove_dir_all(&partial).map_err(|source| JdtlsError::PathIo {
+            path: partial.clone(),
+            source,
+        })?;
+    }
+    std::fs::create_dir_all(&partial).map_err(|source| JdtlsError::PathIo {
+        path: partial.clone(),
+        source,
+    })?;
+    let archive = partial.join("jdk.tar.gz");
+    let bytes = download_bytes(PINNED_JDK_URL).await?;
+    let actual = sha256_hex(&bytes);
+    if actual != PINNED_JDK_SHA256 {
+        let _ = std::fs::remove_dir_all(&partial);
+        return Err(JdtlsError::Checksum {
+            expected: PINNED_JDK_SHA256.to_owned(),
+            actual,
+        });
+    }
+    std::fs::write(&archive, &bytes).map_err(|source| JdtlsError::PathIo {
+        path: archive.clone(),
+        source,
+    })?;
+    extract_archive(&archive, &partial)?;
+    let _ = std::fs::remove_file(&archive);
+    let home = locate_jdk(&partial).ok_or_else(|| {
+        JdtlsError::Installation("the Temurin archive did not contain bin/java".to_owned())
+    })?;
+    if destination.exists() {
+        std::fs::remove_dir_all(destination).map_err(|source| JdtlsError::PathIo {
+            path: destination.to_path_buf(),
+            source,
+        })?;
+    }
+    std::fs::rename(&home, destination).map_err(|source| JdtlsError::PathIo {
+        path: destination.to_path_buf(),
+        source,
+    })?;
+    if partial.exists() {
+        let _ = std::fs::remove_dir_all(&partial);
+    }
+    Ok(destination.to_path_buf())
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+async fn provision_jdk(destination: &Path) -> Result<PathBuf, JdtlsError> {
+    let _ = destination;
+    Err(JdtlsError::Installation(
+        "automatic JDK 25 provisioning is available for Linux x86_64. Install a JDK 25 and set JAVAIDE_JDTLS_JAVA_HOME."
+            .to_owned(),
+    ))
+}
+
+/// Finds `bin/java` at `root` or in one child directory.
+fn locate_jdk(root: &Path) -> Option<PathBuf> {
+    if root.join("bin").join("java").is_file() {
+        return Some(root.to_path_buf());
+    }
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut found = None;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.join("bin").join("java").is_file() {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(path);
+        }
+    }
+    found
+}
+
 async fn download_archive() -> Result<Vec<u8>, JdtlsError> {
+    download_bytes(PINNED_JDTLS_URL).await
+}
+
+async fn download_bytes(url: &str) -> Result<Vec<u8>, JdtlsError> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(180))
+        .timeout(Duration::from_secs(300))
         .build()
         .map_err(|error| JdtlsError::Download(error.to_string()))?;
     let response = client
-        .get(PINNED_JDTLS_URL)
+        .get(url)
         .send()
         .await
         .map_err(|error| JdtlsError::Download(error.to_string()))?;
     if !response.status().is_success() {
         return Err(JdtlsError::Download(format!(
-            "HTTP {} from {PINNED_JDTLS_URL}",
+            "HTTP {} from {url}",
             response.status()
         )));
     }
@@ -171,6 +287,28 @@ mod tests {
         std::fs::create_dir_all(root.join("config_linux")).unwrap();
         let found = ensure_jdtls(&root).await.expect("existing layout");
         assert_eq!(found, root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn existing_jdk_home_is_reused() {
+        let root = std::env::temp_dir().join(format!("javaide-jdk-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin").join("java"), b"java").unwrap();
+        let found = ensure_jdk(&root).await.expect("existing jdk");
+        assert_eq!(found, root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nested_jdk_home_is_found() {
+        let root = std::env::temp_dir().join(format!("javaide-jdk-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let nested = root.join("jdk-25.0.5+8");
+        std::fs::create_dir_all(nested.join("bin")).unwrap();
+        std::fs::write(nested.join("bin").join("java"), b"java").unwrap();
+        assert_eq!(locate_jdk(&root).as_deref(), Some(nested.as_path()));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

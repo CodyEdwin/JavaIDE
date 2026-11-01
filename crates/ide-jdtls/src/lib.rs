@@ -46,14 +46,15 @@ mod config;
 mod features;
 mod intelligence;
 mod provision;
+mod surface;
 mod text;
 
 use std::path::PathBuf;
 
 pub use client::{JdtlsClient, JdtlsEvent};
 pub use config::{
-    JdtlsConfig, JdtlsInstallation, file_uri, is_launcher_jar, java_executable, parse_java_major,
-    uri_to_path,
+    JDTLS_MIN_JAVA, JdtlsConfig, JdtlsInstallation, file_uri, is_launcher_jar, java_executable,
+    parse_java_major, uri_to_path,
 };
 pub use features::{
     CompletionCandidate, DocumentDiagnostics, HoverInfo, JavaDiagnostic, MAX_COMPLETION_CANDIDATES,
@@ -62,7 +63,11 @@ pub use features::{
 pub use intelligence::{
     FileEdits, JavaCodeAction, JavaSignature, JavaSymbol, PrepareRename, SignatureParameter,
 };
-pub use provision::{PINNED_JDTLS_SHA256, PINNED_JDTLS_VERSION, ensure_jdtls};
+pub use provision::{
+    PINNED_JDK_SHA256, PINNED_JDK_VERSION, PINNED_JDTLS_SHA256, PINNED_JDTLS_VERSION, ensure_jdk,
+    ensure_jdtls,
+};
+pub use surface::{CodeLensView, FoldRange, HierarchyNode, InlayHintView, SemanticToken};
 pub use text::{WorkspaceEditOutcome, apply_text_edits, apply_workspace_edit, position_to_offset};
 
 /// Errors from provisioning, launching, or talking to jdtls.
@@ -80,8 +85,8 @@ pub enum JdtlsError {
     /// The Java runtime is missing.
     #[error("Java runtime is missing: {0}")]
     JavaMissing(PathBuf),
-    /// The Java version is below jdtls's minimum.
-    #[error("Java {found} is too old for jdtls; version 21 or newer is required")]
+    /// The Java version is below the pinned jdtls build's minimum.
+    #[error("Java {found} is too old for this jdtls build; JDK 25 or newer is required")]
     JavaTooOld {
         /// Detected major version.
         found: u32,

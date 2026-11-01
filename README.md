@@ -7,10 +7,11 @@ The Java intelligence is provided by the
 [Eclipse JDT Language Server (jdtls)](https://github.com/eclipse-jdtls/eclipse.jdt.ls).
 The IDE does not reimplement javac, a Java parser, or a Gradle build engine.
 
-> **Status: Phase 2 in progress.** Phase 1 editing, trust, and Gradle
-> compile/run/test are in place. Phase 2 has wired rename, references, code
-> actions, signature help, and symbols to a pinned jdtls that the shell
-> downloads on first launch. The checklist is in
+> **Status: Phase 2 language surface is in place.** Phase 1 editing, trust, and
+> Gradle compile/run/test are in place. Phase 2 adds the rest of the jdtls
+> navigation and edit matrix (semantic tokens, hierarchies, code lens, inlay
+> hints, version-checked workspace edits, multi-root import) and an OpenCode
+> permission inbox. The checklist is in
 > [docs/PHASE2_STATUS.md](docs/PHASE2_STATUS.md).
 
 ## Run the desktop shell
@@ -26,15 +27,18 @@ cd apps/desktop && npm install && npm run tauri dev
 The shell opens `fixtures/java-gradle` by default. Use **Open Folder** for
 another workspace, or set `JAVAIDE_WORKSPACE=/absolute/path` before launch. The
 Gradle bridge is restarted for each workspace, so the panel always describes the
-currently open project. JDKs are taken from `JAVA_HOME`, then common Temurin
-paths, then a scan of `/usr/lib/jvm` and `/Library/Java/JavaVirtualMachines`.
+currently open project. JDKs are taken from `JAVAIDE_JDTLS_JAVA_HOME`, then
+`JAVA_HOME`, then common Temurin paths, then a scan of `/usr/lib/jvm` and
+`/Library/Java/JavaVirtualMachines`. Gradle itself still runs on JDK 17+.
 OpenCode is discovered from the local V2 service and is optional.
 
 If `JAVAIDE_JDTLS_HOME` is unset, the first Java file in a trusted folder
 downloads jdtls `1.64.0-202610301801` (about 48 MB, SHA-256 checked) into the
-user data directory. That build needs JDK 25; the shell uses the newest JDK it
-finds. `F2` renames, `Shift+F12` finds references, and `Ctrl/Cmd+.` lists code
-actions.
+user data directory. That build needs JDK 25. When none is installed, Linux
+x86_64 downloads Temurin `25.0.5+8` (SHA-256 checked) into the data directory;
+other platforms ask for `JAVAIDE_JDTLS_JAVA_HOME`. `F2` renames, `Shift+F12`
+finds references, and `Ctrl/Cmd+.` lists code actions. Pending OpenCode
+permissions show in the OpenCode panel as Once, Always, and Reject.
 
 The first time a folder opens, the banner asks you to trust it. Until you do,
 the editor still works, and Gradle, jdtls, and OpenCode stay off. **Compile**,
@@ -124,9 +128,9 @@ assumptions. See [ROADMAP.md](docs/ROADMAP.md) for the gates.
 2. **Phase 1:** the shell, editor, basic LSP, trust, settings, command palette,
    and Gradle compile/run/test are in place. See
    [PHASE1_STATUS.md](docs/PHASE1_STATUS.md).
-3. **Phase 2:** rename, references, code actions, signature help, and symbols
-   are in the shell. Hierarchies, semantic tokens, multi-root import, and
-   OpenCode permissions are not. See
+3. **Phase 2:** the jdtls feature matrix, version-checked workspace edits,
+   multi-root import, and the OpenCode permission inbox are in the shell.
+   Context bundles and forms are not. See
    [PHASE2_STATUS.md](docs/PHASE2_STATUS.md).
 4. **Phase 3+:** Gradle depth, run configurations, debugger, assistant depth, release.
 
