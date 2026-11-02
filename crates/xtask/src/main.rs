@@ -18,12 +18,16 @@ use serde_json::Value;
 /// change as a new edge.
 const ALLOWED: &[(&str, &[&str])] = &[
     ("ide-config", &[]),
+    ("ide-app", &["ide-context", "ide-domain", "ide-editor", "ide-workspace"]),
+    ("ide-context", &["ide-domain", "ide-editor"]),
     ("ide-domain", &[]),
+    ("ide-editor", &["ide-domain"]),
     ("ide-gradle", &["ide-jsonrpc", "ide-platform"]),
     ("ide-jdtls", &["ide-jsonrpc", "ide-platform"]),
     ("ide-jsonrpc", &[]),
     ("ide-opencode", &["ide-platform"]),
     ("ide-ui-api", &["ide-domain"]),
+    ("ide-workspace", &["ide-domain", "ide-editor", "ide-platform"]),
     (
         "ide-phase0",
         &["ide-gradle", "ide-jdtls", "ide-opencode", "ide-platform"],

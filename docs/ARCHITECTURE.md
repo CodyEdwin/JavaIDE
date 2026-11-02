@@ -36,7 +36,7 @@ code or update the document in the same pull request.
 | `ide-jdtls` | jdtls provisioning/launch, lifecycle, settings mapping, jdtls custom requests/notifications, Java project model | `ide-lsp`, `ide-platform`, `ide-config`, `ide-domain` | app, UI, Gradle bridge |
 | `ide-gradle` | Sidecar client, Gradle model/task/test DTOs, sync orchestration, classpath resolution | `ide-jsonrpc`, `ide-platform`, `ide-domain` | app, UI, jdtls internals |
 | `ide-debug` | Java debug orchestration, launch configs, breakpoints, DAP feature mapping | `ide-dap`, `ide-domain`, `ide-platform` | UI, app |
-| `ide-editor` | Rope buffer, edits, line index, UTF-8/UTF-16 conversion, selections, syntax tree, folding | std, ropey, tree-sitter | LSP, UI |
+| `ide-editor` | Rope buffer, edits, line index, UTF-8/UTF-16 conversion, selections, syntax tree, folding | `ide-domain`, ropey, tree-sitter | LSP, UI |
 | `ide-workspace` | Document store, file tree index, watcher, save/atomic write, external changes, search | `ide-domain`, `ide-editor`, `ide-platform` | LSP, Gradle, UI |
 | `ide-config` | Settings schema/defaults/validation, launch config schema, paths, migrations | serde, schemars | UI, concrete adapters |
 | `ide-platform` | OS paths, JDK discovery, process groups, downloads, archives, terminal PTY | std/tokio only | domain semantics |

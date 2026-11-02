@@ -1,7 +1,11 @@
 [workspace]
 resolver = "3"
 members = [
+  "crates/ide-app",
+  "crates/ide-context",
   "crates/ide-domain",
+  "crates/ide-editor",
+  "crates/ide-workspace",
   "crates/ide-jsonrpc",
   "crates/ide-platform",
   "crates/ide-config",
@@ -42,6 +46,8 @@ uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 ts-rs = { version = "7", features = ["impl-export"] }
 schemars = "0.10"
+ropey = "1"
+tree-sitter = "0.23"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

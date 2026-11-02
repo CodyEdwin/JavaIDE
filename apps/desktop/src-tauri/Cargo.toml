@@ -14,11 +14,15 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 anyhow = "1"
+ide-app = { path = "../../../crates/ide-app" }
 ide-config = { path = "../../../crates/ide-config" }
+ide-editor = { path = "../../../crates/ide-editor" }
 ide-gradle = { path = "../../../crates/ide-gradle" }
 ide-jdtls = { path = "../../../crates/ide-jdtls" }
 ide-opencode = { path = "../../../crates/ide-opencode" }
 ide-platform = { path = "../../../crates/ide-platform" }
+ide-ui-api = { path = "../../../crates/ide-ui-api" }
+ide-workspace = { path = "../../../crates/ide-workspace" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
