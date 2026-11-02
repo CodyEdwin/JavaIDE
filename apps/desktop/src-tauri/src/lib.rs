@@ -2233,6 +2233,60 @@ fn truncate_log_line(message: &str) -> String {
     truncated
 }
 
+/// Unified command dispatch using ide-ui-api types.
+#[tauri::command]
+async fn dispatch_command(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    envelope: ide_ui_api::Envelope<ide_ui_api::Command>,
+) -> Result<ide_ui_api::Envelope<ide_ui_api::Event>, String> {
+    match envelope.payload {
+        ide_ui_api::Command::OpenWorkspace(cmd) => {
+            let view = open_workspace(app, state, cmd.path).await?;
+            Ok(ide_ui_api::Envelope::new(envelope.request_id, ide_ui_api::Event::WorkspaceOpened(
+                ide_ui_api::WorkspaceOpened {
+                    root: view.root,
+                    trust: view.trust,
+                },
+            )))
+        }
+        ide_ui_api::Command::TrustWorkspace(cmd) => {
+            let view = set_workspace_trust(app, state, cmd.trusted).await?;
+            Ok(ide_ui_api::Envelope::new(envelope.request_id, ide_ui_api::Event::TrustChanged(
+                ide_ui_api::TrustChanged {
+                    root: view.root,
+                    trust: view.trust,
+                },
+            )))
+        }
+        ide_ui_api::Command::OpenDocument(cmd) => {
+            let status = java_open_document(app, state, cmd.uri, cmd.text, cmd.version).await?;
+            Ok(ide_ui_api::Envelope::new(envelope.request_id, ide_ui_api::Event::DocumentOpened(
+                ide_ui_api::DocumentOpened {
+                    uri: cmd.uri.clone(),
+                    version: cmd.version,
+                },
+            )))
+        }
+        ide_ui_api::Command::ChangeDocument(cmd) => {
+            java_change_document(state, cmd.uri.clone(), cmd.text, cmd.version).await?;
+            Ok(ide_ui_api::Envelope::new(envelope.request_id, ide_ui_api::Event::DocumentChanged(
+                ide_ui_api::DocumentChanged {
+                    uri: cmd.uri,
+                    version: cmd.version,
+                },
+            )))
+        }
+        ide_ui_api::Command::SaveDocument(cmd) => {
+            java_save_document(state, cmd.uri.clone()).await?;
+            Ok(ide_ui_api::Envelope::new(envelope.request_id, ide_ui_api::Event::DocumentSaved(
+                ide_ui_api::DocumentSaved { uri: cmd.uri },
+            )))
+        }
+        _ => Err("command not yet implemented via dispatch".to_owned()),
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -2291,6 +2345,7 @@ pub fn run() {
             opencode_interrupt,
             opencode_permissions,
             opencode_reply_permission,
+            dispatch_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running JavaIDE");
