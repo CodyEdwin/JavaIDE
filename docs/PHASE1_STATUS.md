@@ -5,8 +5,8 @@
   navigates, and hosts a streaming OpenCode conversation
   ([ROADMAP.md](ROADMAP.md#4-phase-1--ide-shell-basic-lsp-and-opencode-chat-46-weeks)).
 - **Overall:** the usable core is in place. A trusted single-module Gradle
-  project can be edited, compiled, run, and tested from the shell. Phase 2
-  (rename, hierarchy, semantic tokens, multi-root import) has not started.
+  project can be edited, compiled, run, and tested from the shell. Later
+  phases continued from here; see [PHASE2_STATUS.md](PHASE2_STATUS.md).
 
 This page is the working checklist for Phase 1. Update it with the code change
 that changes the status, not afterwards.

@@ -159,19 +159,19 @@ hosts a streaming OpenCode conversation.
 
 ### Not in Phase 1
 
-- Rename, code actions, semantic tokens, call hierarchy, code lens.
+- Rename, code actions, semantic tokens, call hierarchy, and code lens (done in Phase 2).
 - Multi-module Gradle model, tasks, tests, debug.
 - OpenCode context/permissions/MCP tools/diffs.
 
 ## 5. Phase 2 — Complete Java intelligence (4–6 weeks)
 
-> **Status (2026-11-01):** in progress. Signature help, references,
-> implementations, type definition, rename, code actions (with resolve),
-> document and workspace symbols, and range formatting are wired through
-> `ide-jdtls` into the shell. The pinned jdtls 1.64 snapshot is downloaded on
-> first launch. Semantic tokens, inlay hints, hierarchies, code lens,
-> multi-root import, and the OpenCode permission inbox are still ahead. See
-> [PHASE2_STATUS.md](PHASE2_STATUS.md).
+> **Status (2026-11-01):** the language-server matrix for this phase is in the
+> shell, including semantic tokens, inlay hints, folding, selection ranges,
+> call and type hierarchy, code lens, `jdt://` documents, multi-root import,
+> and a version-checked `workspace/applyEdit` path. The OpenCode permission
+> inbox replies `once` / `always` / `reject` and refreshes after reconnect.
+> Still ahead inside the phase: the assistant context bundle, forms, and
+> broken-build import UX. See [PHASE2_STATUS.md](PHASE2_STATUS.md).
 
 **Goal:** the jdtls adapter is feature-complete for v1 and robust against real
 projects.

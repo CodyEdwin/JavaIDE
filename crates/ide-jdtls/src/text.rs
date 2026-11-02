@@ -2,22 +2,25 @@
 //!
 //! jdtls sends positions in UTF-16 code units. The canonical text model in this
 //! workspace is UTF-8 bytes (ADR 0006), so every edit is converted at this
-//! boundary. Phase 0 supports plain `changes` edits; `documentChanges` and
-//! resource operations are rejected instead of partially applied.
+//! boundary. `changes` and versioned `documentChanges` are planned for the
+//! editor. Resource operations are rejected instead of partially applied.
 //!
-//! Writes are atomic per file: content is prepared for every file first, then
-//! each file is replaced through a temporary file in the same directory. A
-//! multi-file edit is not yet transactional across files; that is a Phase 2
-//! requirement and is documented rather than hidden.
+//! The planner validates edits and returns them to the editor. It does not
+//! write the workspace. A version on a `documentChanges` entry must match the
+//! open buffer; a mismatch is rejected instead of being applied to newer text.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use lsp_types::{Position, TextEdit, WorkspaceEdit};
+use lsp_types::{
+    DocumentChangeOperation, DocumentChanges, OneOf, Position, TextDocumentEdit, TextEdit,
+    WorkspaceEdit,
+};
 
 use crate::JdtlsError;
 use crate::config::uri_to_path;
+use crate::features::text_edits;
+use crate::intelligence::FileEdits;
 
 /// Result of applying a workspace edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,86 +31,193 @@ pub struct WorkspaceEditOutcome {
     pub edits_applied: usize,
 }
 
-/// Applies an LSP workspace edit restricted to `workspace_root`.
+/// Validates a workspace edit and returns per-file buffer edits.
 ///
-/// # Rules
-///
-/// - only `changes` edits are supported;
-/// - every target must resolve inside `workspace_root`;
-/// - files must exist and be valid UTF-8;
-/// - overlapping edits in one file are rejected;
-/// - files are written atomically, preserving permissions where possible.
+/// Nothing is written. `open_versions` maps a document URI to the editor's
+/// current version. A `documentChanges` entry whose version does not match is
+/// rejected. Unversioned `changes` entries are accepted and applied by the
+/// editor to whatever buffer it has open.
 ///
 /// # Errors
 ///
-/// Returns [`JdtlsError::WorkspaceEdit`] for unsupported edit shapes, invalid
-/// positions, overlaps, or paths outside the workspace.
+/// Returns [`JdtlsError::WorkspaceEdit`] for resource operations, paths outside
+/// the workspace, overlapping ranges, or a stale document version.
+pub fn plan_workspace_edit(
+    workspace_root: &Path,
+    edit: &WorkspaceEdit,
+    open_versions: &BTreeMap<String, i32>,
+) -> Result<Vec<FileEdits>, JdtlsError> {
+    plan_workspace_edit_roots(&[workspace_root.to_path_buf()], edit, open_versions)
+}
+
+/// Validates a workspace edit against every root in a multi-root workspace.
+///
+/// # Errors
+///
+/// Same as [`plan_workspace_edit`]. A path must sit inside one of `roots`.
+pub fn plan_workspace_edit_roots(
+    roots: &[PathBuf],
+    edit: &WorkspaceEdit,
+    open_versions: &BTreeMap<String, i32>,
+) -> Result<Vec<FileEdits>, JdtlsError> {
+    let mut canonical_roots = Vec::new();
+    for root in roots {
+        let canonical = root.canonicalize().map_err(|error| JdtlsError::PathIo {
+            path: root.clone(),
+            source: error,
+        })?;
+        if !canonical_roots.contains(&canonical) {
+            canonical_roots.push(canonical);
+        }
+    }
+    if canonical_roots.is_empty() {
+        return Err(JdtlsError::WorkspaceEdit(
+            "workspace edit has no workspace root".to_owned(),
+        ));
+    }
+    let mut grouped: BTreeMap<PathBuf, Vec<TextEdit>> = BTreeMap::new();
+    collect_changes(edit, &canonical_roots, open_versions, &mut grouped)?;
+    if grouped.is_empty() {
+        return Err(JdtlsError::WorkspaceEdit(
+            "workspace edit contains no file changes".to_owned(),
+        ));
+    }
+    let mut files = Vec::new();
+    for (path, edits) in grouped {
+        reject_overlaps(&edits)?;
+        files.push(FileEdits {
+            path,
+            edits: text_edits(edits),
+        });
+    }
+    Ok(files)
+}
+
+/// Counts a validated workspace edit without writing it.
+///
+/// This replaces the Phase 0 disk writer. Callers apply [`FileEdits`] to
+/// editor buffers.
+///
+/// # Errors
+///
+/// Same as [`plan_workspace_edit`] with an empty version map.
 pub fn apply_workspace_edit(
     workspace_root: &Path,
     edit: &WorkspaceEdit,
 ) -> Result<WorkspaceEditOutcome, JdtlsError> {
-    if edit.document_changes.is_some() {
-        return Err(JdtlsError::WorkspaceEdit(
-            "documentChanges edits are not supported in Phase 0".to_owned(),
-        ));
-    }
-    // `Uri` caches its parsed form in a `Cell`. Hash and equality ignore that
-    // cache, so holding the server's change map is sound.
-    #[allow(clippy::mutable_key_type)]
-    let changes = edit.changes.as_ref().ok_or_else(|| {
-        JdtlsError::WorkspaceEdit("workspace edit contains no changes".to_owned())
-    })?;
-
-    let root = workspace_root
-        .canonicalize()
-        .map_err(|error| JdtlsError::PathIo {
-            path: workspace_root.to_path_buf(),
-            source: error,
-        })?;
-
-    let mut updates: BTreeMap<PathBuf, (String, usize)> = BTreeMap::new();
-    for (uri, edits) in changes {
-        let path = uri_to_path(uri)?;
-        let canonical = path.canonicalize().map_err(|error| JdtlsError::PathIo {
-            path: path.clone(),
-            source: error,
-        })?;
-        if !canonical.starts_with(&root) {
-            return Err(JdtlsError::WorkspaceEdit(format!(
-                "refusing to edit outside the workspace: {}",
-                canonical.display()
-            )));
-        }
-        if updates.contains_key(&canonical) {
-            return Err(JdtlsError::WorkspaceEdit(format!(
-                "workspace edit targets the same file twice: {}",
-                canonical.display()
-            )));
-        }
-
-        let bytes = std::fs::read(&canonical).map_err(|error| JdtlsError::PathIo {
-            path: canonical.clone(),
-            source: error,
-        })?;
-        let text = String::from_utf8(bytes).map_err(|_| {
-            JdtlsError::WorkspaceEdit(format!("{} is not valid UTF-8", canonical.display()))
-        })?;
-        let updated = apply_text_edits(&text, edits)?;
-        if updated != text {
-            updates.insert(canonical, (updated, edits.len()));
-        }
-    }
-
-    let mut edits_applied = 0usize;
-    for (path, (content, count)) in &updates {
-        write_atomic(path, content)?;
-        edits_applied += count;
-    }
-
+    let files = plan_workspace_edit(workspace_root, edit, &BTreeMap::new())?;
+    let edits_applied = files.iter().map(|file| file.edits.len()).sum();
     Ok(WorkspaceEditOutcome {
-        files_changed: updates.len(),
+        files_changed: files.len(),
         edits_applied,
     })
+}
+
+#[allow(clippy::mutable_key_type)]
+fn collect_changes(
+    edit: &WorkspaceEdit,
+    roots: &[PathBuf],
+    open_versions: &BTreeMap<String, i32>,
+    grouped: &mut BTreeMap<PathBuf, Vec<TextEdit>>,
+) -> Result<(), JdtlsError> {
+    if let Some(changes) = edit.changes.as_ref() {
+        for (uri, edits) in changes {
+            let path = file_inside(roots, uri)?;
+            grouped.entry(path).or_default().extend(edits.clone());
+        }
+    }
+    if let Some(document_changes) = &edit.document_changes {
+        let operations = match document_changes {
+            DocumentChanges::Edits(edits) => edits
+                .iter()
+                .map(|edit| DocumentChangeOperation::Edit(edit.clone()))
+                .collect::<Vec<_>>(),
+            DocumentChanges::Operations(operations) => operations.clone(),
+        };
+        for operation in operations {
+            match operation {
+                DocumentChangeOperation::Op(_) => {
+                    return Err(JdtlsError::WorkspaceEdit(
+                        "file create, rename, and delete operations are not applied".to_owned(),
+                    ));
+                }
+                DocumentChangeOperation::Edit(edit) => {
+                    remember_document_edit(roots, open_versions, grouped, &edit)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remember_document_edit(
+    roots: &[PathBuf],
+    open_versions: &BTreeMap<String, i32>,
+    grouped: &mut BTreeMap<PathBuf, Vec<TextEdit>>,
+    edit: &TextDocumentEdit,
+) -> Result<(), JdtlsError> {
+    let uri = edit.text_document.uri.as_str();
+    if let Some(version) = edit.text_document.version {
+        match open_versions.get(uri) {
+            Some(open) if *open == version => {}
+            Some(open) => {
+                return Err(JdtlsError::WorkspaceEdit(format!(
+                    "stale edit for {uri}: edit version {version}, buffer version {open}"
+                )));
+            }
+            None => {
+                return Err(JdtlsError::WorkspaceEdit(format!(
+                    "edit for {uri} names version {version}, but that document is not open"
+                )));
+            }
+        }
+    }
+    let path = file_inside(roots, &edit.text_document.uri)?;
+    let edits = edit
+        .edits
+        .iter()
+        .map(|edit| match edit {
+            OneOf::Left(text) => text.clone(),
+            OneOf::Right(annotated) => annotated.text_edit.clone(),
+        })
+        .collect::<Vec<_>>();
+    grouped.entry(path).or_default().extend(edits);
+    Ok(())
+}
+
+fn file_inside(roots: &[PathBuf], uri: &lsp_types::Uri) -> Result<PathBuf, JdtlsError> {
+    let path = uri_to_path(uri)?;
+    let canonical = path.canonicalize().unwrap_or(path);
+    let allowed = roots.iter().any(|root| canonical.starts_with(root));
+    if !allowed {
+        return Err(JdtlsError::WorkspaceEdit(format!(
+            "refusing to edit outside the workspace: {}",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn reject_overlaps(edits: &[TextEdit]) -> Result<(), JdtlsError> {
+    let mut ordered = edits.to_vec();
+    ordered.sort_by_key(|edit| {
+        (
+            edit.range.start.line,
+            edit.range.start.character,
+            edit.range.end.line,
+            edit.range.end.character,
+        )
+    });
+    for pair in ordered.windows(2) {
+        let end = (pair[0].range.end.line, pair[0].range.end.character);
+        let next = (pair[1].range.start.line, pair[1].range.start.character);
+        if next < end {
+            return Err(JdtlsError::WorkspaceEdit(
+                "overlapping edits in one file were rejected".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Applies LSP text edits to a string.
@@ -216,54 +326,6 @@ pub fn position_to_offset(text: &str, position: Position) -> Result<usize, Jdtls
     }
 }
 
-fn write_atomic(path: &Path, content: &str) -> Result<(), JdtlsError> {
-    let parent = path.parent().ok_or_else(|| {
-        JdtlsError::WorkspaceEdit(format!("{} has no parent directory", path.display()))
-    })?;
-    let mut temporary =
-        tempfile::NamedTempFile::new_in(parent).map_err(|error| JdtlsError::PathIo {
-            path: parent.to_path_buf(),
-            source: error,
-        })?;
-    if let Ok(metadata) = std::fs::metadata(path) {
-        temporary
-            .as_file()
-            .set_permissions(metadata.permissions())
-            .map_err(|error| JdtlsError::PathIo {
-                path: path.to_path_buf(),
-                source: error,
-            })?;
-    }
-    temporary
-        .write_all(content.as_bytes())
-        .map_err(|error| JdtlsError::PathIo {
-            path: path.to_path_buf(),
-            source: error,
-        })?;
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(|error| JdtlsError::PathIo {
-            path: path.to_path_buf(),
-            source: error,
-        })?;
-    // `persist` replaces the destination on Unix. On Windows it fails if the
-    // destination exists; a platform-specific replace path is a Phase 2 item.
-    temporary
-        .persist(path)
-        .map_err(|error| JdtlsError::PathIo {
-            path: path.to_path_buf(),
-            source: error.error,
-        })?;
-
-    // Best-effort directory fsync so the rename survives a crash on Unix.
-    #[cfg(unix)]
-    if let Ok(directory) = std::fs::File::open(parent) {
-        let _ = directory.sync_all();
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use lsp_types::Range;
@@ -353,6 +415,40 @@ mod tests {
     fn rejects_reversed_ranges() {
         let error = apply_text_edits("abc", &[edit((0, 2), (0, 1), "x")]).unwrap_err();
         assert!(error.to_string().contains("start"));
+    }
+
+    #[test]
+    fn stale_document_version_is_rejected_without_writing() {
+        let root = std::env::temp_dir().join(format!("javaide-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("A.java");
+        std::fs::write(&file, "class A {}\n").unwrap();
+        let uri = crate::config::file_uri(&file).unwrap();
+        let edit = WorkspaceEdit {
+            changes: None,
+            document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
+                    uri,
+                    version: Some(2),
+                },
+                edits: vec![OneOf::Left(edit((0, 6), (0, 7), "B"))],
+            }])),
+            change_annotations: None,
+        };
+        let mut versions = BTreeMap::new();
+        versions.insert(edit_uri(&edit), 4);
+        let error = plan_workspace_edit(&root, &edit, &versions).unwrap_err();
+        assert!(error.to_string().contains("stale"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "class A {}\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn edit_uri(edit: &WorkspaceEdit) -> String {
+        match edit.document_changes.as_ref().unwrap() {
+            DocumentChanges::Edits(edits) => edits[0].text_document.uri.as_str().to_owned(),
+            DocumentChanges::Operations(_) => String::new(),
+        }
     }
 
     #[test]

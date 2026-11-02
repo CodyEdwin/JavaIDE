@@ -39,8 +39,8 @@ mod mcp;
 
 pub use client::{
     BasicCredentials, CreateSession, DiffQuery, FileDiff, ModelRef, OpenCodeClient,
-    PermissionReply, PromptFile, PromptInput, ServerInfo, ServerPaths, Session, SessionCursor,
-    SessionLocation, SessionPage, SessionTime,
+    PermissionReply, PermissionRequest, PromptFile, PromptInput, ServerInfo, ServerPaths, Session,
+    SessionCursor, SessionLocation, SessionPage, SessionTime,
 };
 pub use discovery::DiscoveredService;
 pub use error::OpenCodeError;

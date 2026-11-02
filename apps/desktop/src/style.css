@@ -604,6 +604,23 @@ button:hover { background: var(--bg-raised); }
   font-size: 11px;
 }
 .reference-item:hover, .code-action-item:hover { background: var(--bg-raised); }
+.inlay-hint {
+  color: var(--muted);
+  font-style: italic;
+  opacity: 0.85;
+  padding: 0 0.2em;
+}
+.cm-content .sem-method, .cm-content .sem-function { color: #82d2ff; }
+.cm-content .sem-class, .cm-content .sem-type, .cm-content .sem-interface, .cm-content .sem-enum { color: #e0c48a; }
+.permission-list { padding: 4px 8px 8px; display: flex; flex-direction: column; gap: 8px; }
+.permission-card {
+  border: 1px solid var(--border);
+  background: var(--bg-raised);
+  border-radius: 6px;
+  padding: 8px;
+}
+.permission-card p { margin: 4px 0; color: var(--muted); }
+.permission-actions { display: flex; gap: 6px; }
 .code-action-item.disabled { opacity: 0.5; cursor: default; }
 .signature-help {
   position: fixed;

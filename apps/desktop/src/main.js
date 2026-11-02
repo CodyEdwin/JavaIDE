@@ -2,8 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { basicSetup } from "codemirror";
-import { EditorState } from "@codemirror/state";
-import { EditorView, hoverTooltip, keymap } from "@codemirror/view";
+import { EditorState, StateEffect, StateField } from "@codemirror/state";
+import { Decoration, EditorView, WidgetType, hoverTooltip, keymap } from "@codemirror/view";
+import { foldService } from "@codemirror/language";
 import { autocompletion } from "@codemirror/autocomplete";
 import { lintGutter, setDiagnostics } from "@codemirror/lint";
 import { java } from "@codemirror/lang-java";
@@ -73,6 +74,9 @@ const state = {
     collapsedProblems: new Set(),
     completionEnabled: true,
     formatEnabled: true,
+    folds: new Map(),
+    surfaceTimers: new Map(),
+    extraRoots: [],
   },
   ai: {
     connected: false,
@@ -80,6 +84,7 @@ const state = {
     session: null,
     streaming: null,
     parts: new Map(),
+    permissions: [],
   },
 };
 
@@ -161,9 +166,52 @@ function activeView() {
   return panes[focusedPane].view;
 }
 
+const setJavaDecorations = StateEffect.define();
+
+const javaDecorationField = StateField.define({
+  create() {
+    return Decoration.none;
+  },
+  update(decorations, transaction) {
+    decorations = decorations.map(transaction.changes);
+    for (const effect of transaction.effects) {
+      if (effect.is(setJavaDecorations)) decorations = effect.value;
+    }
+    return decorations;
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});
+
+class InlayWidget extends WidgetType {
+  constructor(text) {
+    super();
+    this.text = text;
+  }
+
+  toDOM() {
+    const span = document.createElement("span");
+    span.className = "inlay-hint";
+    span.textContent = this.text;
+    return span;
+  }
+
+  eq(other) {
+    return other.text === this.text;
+  }
+}
+
 function editorExtensions(path, pane) {
   return [
     basicSetup,
+    javaDecorationField,
+    foldService.of((editorState, lineStart) => {
+      const ranges = state.java.folds.get(path) || [];
+      const line = editorState.doc.lineAt(lineStart);
+      const match = ranges.find((range) => range.startLine === line.number - 1);
+      if (!match || match.endLine <= match.startLine) return null;
+      const endLine = Math.min(match.endLine + 1, editorState.doc.lines);
+      return { from: line.to, to: editorState.doc.line(endLine).to };
+    }),
     oneDark,
     languageFor(path),
     lintGutter(),
@@ -247,6 +295,7 @@ function editorExtensions(path, pane) {
       const doc = current ? state.docs.get(current) : null;
       if (!doc) return;
       doc.content = update.state.doc.toString();
+      if (doc.virtual) return;
       if (!doc.dirty) {
         doc.dirty = true;
         renderTabs();
@@ -254,6 +303,7 @@ function editorExtensions(path, pane) {
       updateStatusRight();
       mirrorPane(pane, current, doc.content);
       javaScheduleChange(current);
+      scheduleJavaSurface(current);
     }),
     EditorView.domEventHandlers({
       mousedown: () => focusPane(pane),
@@ -301,6 +351,7 @@ function showPane(pane, path) {
       EditorState.create({ doc: doc.content, extensions: editorExtensions(doc.path, pane) }),
     );
     applyJavaDiagnostics(path);
+    if (isJavaPath(path) && !doc.virtual) scheduleJavaSurface(path);
   }
   updateWelcome();
   updatePaneChrome();
@@ -418,6 +469,10 @@ async function saveActive() {
   if (!state.active) return;
   const doc = state.docs.get(state.active);
   if (!doc) return;
+  if (doc.virtual) {
+    setStatus("Decompiled sources are read-only");
+    return;
+  }
   try {
     await call("write_file", { path: doc.path, content: doc.content });
     doc.dirty = false;
@@ -922,6 +977,8 @@ function workspaceTrusted() {
 
 function javaDocumentOpened(path, text) {
   if (!workspaceTrusted()) return;
+  const existing = state.docs.get(path);
+  if (existing?.virtual) return;
   if (!isJavaPath(path) || !state.docs.has(path)) return;
   if (state.java.opened.has(path)) return;
   state.java.opened.add(path);
@@ -1336,14 +1393,39 @@ async function jumpToDefinition() {
       return;
     }
     const target = locations.find((location) => location.path === path) || locations[0];
-    await openAbsoluteFile(
-      target.path,
-      target.range?.start?.line || 0,
-      target.range?.start?.character || 0,
-    );
+    await openLocation(target);
     if (locations.length > 1) setStatus(`${locations.length} definitions available`);
   } catch (error) {
     showError(String(error));
+  }
+}
+
+async function openLocation(location) {
+  if (!location) return;
+  const line = location.range?.start?.line || location.line || 0;
+  const character = location.range?.start?.character || location.character || 0;
+  if (location.uri && String(location.uri).startsWith("jdt:")) {
+    await openDecompiled(location.uri, line, character);
+    return;
+  }
+  if (location.path) await openAbsoluteFile(location.path, line, character);
+}
+
+async function openDecompiled(uri, line = 0, character = 0) {
+  setBusy("Reading decompiled source…");
+  try {
+    const content = await invoke("java_class_file", { uri });
+    const name = decodeURIComponent(uri.split("/").pop() || "class").split("?")[0];
+    state.docs.set(uri, { path: uri, name, content, dirty: false, virtual: true });
+    state.active = uri;
+    renderTabs();
+    showActiveDocument();
+    revealLine(line, character);
+    setStatus(`Decompiled ${name}`);
+  } catch (error) {
+    showError(String(error));
+  } finally {
+    clearBusy();
   }
 }
 
@@ -1476,6 +1558,7 @@ async function aiConnect() {
     state.ai.connected = true;
     $("ai-status").textContent = `OpenCode ${info.version} · pid ${info.pid} · ${info.url}`;
     await aiRefreshSessions();
+    await refreshPermissions();
     updateStatusRight();
     setStatus("OpenCode connected");
   } catch (error) {
@@ -1538,6 +1621,7 @@ async function aiSelectSession(session) {
   } catch (error) {
     aiAppend("error", String(error), "error");
   }
+  await refreshPermissions();
 }
 
 function renderAiSessions() {
@@ -1597,10 +1681,15 @@ async function aiSend() {
 
 function handleAiEvent(payload) {
   if (!payload || typeof payload.name !== "string") return;
+  const name = payload.name;
+  if (name === "stream.reconnected" || name === "stream.closed" || name.includes("permission")) {
+    if (state.ai.session) refreshSessionContext(state.ai.session);
+    refreshPermissions();
+    if (name === "stream.reconnected" || name === "stream.closed") return;
+  }
   // Only render the session the user selected. The service broadcasts events
   // for every session; rendering all of them floods the webview.
   if (!state.ai.session) return;
-  const name = payload.name;
   const data = payload.data || {};
   const sessionId =
     data.sessionID ||
@@ -1613,6 +1702,7 @@ function handleAiEvent(payload) {
   if (name === "session.idle") {
     setStatus("OpenCode idle");
     if (state.ai.session) refreshSessionContext(state.ai.session);
+    refreshPermissions();
     return;
   }
   if (name === "session.error" || name.endsWith(".error")) {
@@ -1643,6 +1733,66 @@ function handleAiEvent(payload) {
   if (name.includes("tool") || name.includes("permission")) {
     const summary = (collectText(data) || JSON.stringify(data)).slice(0, 500);
     aiAppend(name, summary, "tool");
+  }
+}
+
+async function refreshPermissions() {
+  if (!state.ai.connected) return;
+  try {
+    const requests = await call("opencode_permissions");
+    state.ai.permissions = Array.isArray(requests) ? requests : [];
+    renderPermissions();
+  } catch (error) {
+    const container = $("ai-permissions");
+    if (container) container.textContent = String(error);
+  }
+}
+
+function renderPermissions() {
+  const container = $("ai-permissions");
+  if (!container) return;
+  const requests = state.ai.session
+    ? state.ai.permissions.filter((request) => !request.sessionId || request.sessionId === state.ai.session)
+    : state.ai.permissions;
+  container.replaceChildren();
+  if (!requests.length) {
+    container.textContent = "No pending permissions";
+    return;
+  }
+  for (const request of requests) {
+    const card = document.createElement("div");
+    card.className = "permission-card";
+    const title = document.createElement("strong");
+    title.textContent = request.action || "Permission";
+    const body = document.createElement("p");
+    body.textContent = request.message || request.resources || request.id;
+    const actions = document.createElement("div");
+    actions.className = "permission-actions";
+    for (const decision of ["once", "always", "reject"]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "text-button";
+      button.textContent = decision === "once" ? "Once" : decision === "always" ? "Always" : "Reject";
+      button.addEventListener("click", () => replyPermission(request, decision));
+      actions.appendChild(button);
+    }
+    card.append(title, body, actions);
+    container.appendChild(card);
+  }
+}
+
+async function replyPermission(request, decision) {
+  try {
+    await call("opencode_reply_permission", {
+      sessionId: request.sessionId || state.ai.session,
+      requestId: request.id,
+      decision,
+    });
+    setStatus(`Permission ${decision}`);
+    await refreshPermissions();
+  } catch (error) {
+    showError(String(error));
+    await refreshPermissions();
   }
 }
 
@@ -1806,6 +1956,166 @@ async function showDebugLog() {
   }
 }
 
+function pathAllowed(path) {
+  if (!path) return false;
+  if (path === state.root || path.startsWith(`${state.root}/`)) return true;
+  return state.java.extraRoots.some((root) => path === root || path.startsWith(`${root}/`));
+}
+
+function scheduleJavaSurface(path) {
+  if (!isJavaPath(path) || !javaReady()) return;
+  const existing = state.java.surfaceTimers.get(path);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(() => {
+    state.java.surfaceTimers.delete(path);
+    refreshJavaSurface(path).catch(() => {});
+  }, 700);
+  state.java.surfaceTimers.set(path, timer);
+}
+
+async function refreshJavaSurface(path) {
+  if (!isJavaPath(path) || !javaReady() || !state.docs.has(path)) return;
+  const view = paneForPath(path);
+  const doc = view?.state.doc;
+  const endLine = doc ? Math.max(doc.lines - 1, 0) : 0;
+  const endCharacter = doc ? doc.line(doc.lines).length : 0;
+  const [tokens, hints, folds, lenses] = await Promise.all([
+    invoke("java_semantic_tokens", { path }).catch(() => []),
+    invoke("java_inlay_hints", { path, endLine, endCharacter }).catch(() => []),
+    invoke("java_folding_ranges", { path }).catch(() => []),
+    invoke("java_code_lens", { path }).catch(() => []),
+  ]);
+  state.java.folds.set(path, Array.isArray(folds) ? folds : []);
+  applyJavaDecorations(path, tokens, hints);
+  renderCodeLenses(lenses);
+}
+
+function applyJavaDecorations(path, tokens, hints) {
+  const view = paneForPath(path);
+  if (!view || view.state.field(javaDecorationField, false) == null) return;
+  const doc = view.state.doc;
+  const ranges = [];
+  for (const token of Array.isArray(tokens) ? tokens : []) {
+    const from = offsetAt(doc, { line: token.line, character: token.start });
+    const to = offsetAt(doc, { line: token.line, character: (token.start || 0) + (token.length || 0) });
+    if (from < to) {
+      ranges.push(Decoration.mark({ class: `sem-${token.tokenType || "token"}` }).range(from, to));
+    }
+  }
+  for (const hint of Array.isArray(hints) ? hints : []) {
+    if (!hint.label) continue;
+    const at = offsetAt(doc, { line: hint.line, character: hint.character });
+    ranges.push(Decoration.widget({ widget: new InlayWidget(hint.label), side: 1 }).range(at));
+  }
+  ranges.sort((left, right) => left.from - right.from || left.to - right.to);
+  const filtered = [];
+  let end = -1;
+  for (const range of ranges) {
+    if (range.from < end) continue;
+    filtered.push(range);
+    end = Math.max(end, range.to);
+  }
+  view.dispatch({ effects: setJavaDecorations.of(Decoration.set(filtered, true)) });
+}
+
+function renderCodeLenses(lenses) {
+  const container = $("java-hierarchy");
+  if (!container || container.dataset.mode === "hierarchy") return;
+  container.replaceChildren();
+  if (!lenses?.length) {
+    container.textContent = "No code lenses";
+    return;
+  }
+  for (const lens of lenses) {
+    const row = document.createElement("div");
+    row.className = "reference-item";
+    row.textContent = `${lens.line + 1}: ${lens.title}`;
+    row.addEventListener("click", () => revealLine(lens.line, lens.character));
+    container.appendChild(row);
+  }
+}
+
+async function expandSelection() {
+  const cursor = cursorPosition();
+  if (!cursor || !isJavaPath(cursor.path) || !javaReady()) return;
+  const ranges = await invoke("java_selection_ranges", {
+    path: cursor.path,
+    line: cursor.line,
+    character: cursor.character,
+  });
+  const doc = cursor.view.state.doc;
+  const currentFrom = cursor.from;
+  const currentTo = cursor.to;
+  const next = (ranges || []).find((range) => {
+    const from = offsetAt(doc, range.start);
+    const to = offsetAt(doc, range.end);
+    return from <= currentFrom && to >= currentTo && (from < currentFrom || to > currentTo);
+  });
+  if (!next) {
+    setStatus("No wider selection");
+    return;
+  }
+  cursor.view.dispatch({
+    selection: { anchor: offsetAt(doc, next.start), head: offsetAt(doc, next.end) },
+    scrollIntoView: true,
+  });
+}
+
+async function showHierarchy(direction, label) {
+  const cursor = cursorPosition();
+  if (!cursor || !isJavaPath(cursor.path) || !javaReady()) {
+    setStatus("Java language server is not ready");
+    return;
+  }
+  showPanel("java");
+  const container = $("java-hierarchy");
+  container.dataset.mode = "hierarchy";
+  container.textContent = `Loading ${label}…`;
+  try {
+    const nodes = await invoke("java_hierarchy", {
+      path: cursor.path,
+      line: cursor.line,
+      character: cursor.character,
+      direction,
+    });
+    container.replaceChildren();
+    if (!nodes?.length) {
+      container.textContent = `No ${label}`;
+      return;
+    }
+    for (const node of nodes) {
+      const row = document.createElement("div");
+      row.className = "reference-item";
+      row.textContent = `${node.kind} ${node.name}`;
+      row.addEventListener("click", () => openLocation(node));
+      container.appendChild(row);
+    }
+    setStatus(`${nodes.length} ${label}`);
+  } catch (error) {
+    container.textContent = String(error);
+  } finally {
+    setTimeout(() => {
+      if (container.dataset.mode === "hierarchy") delete container.dataset.mode;
+    }, 8000);
+  }
+}
+
+async function addWorkspaceFolder() {
+  if (!javaReady()) {
+    setStatus("Java language server is not ready");
+    return;
+  }
+  const selected = await open({ directory: true, multiple: false, title: "Add workspace folder" });
+  if (!selected || typeof selected !== "string") return;
+  try {
+    await invoke("java_add_folder", { path: selected });
+    if (!state.java.extraRoots.includes(selected)) state.java.extraRoots.push(selected);
+    setStatus(`Imported ${selected}`);
+  } catch (error) {
+    showError(String(error));
+  }
+}
+
 const COMMANDS = [
   { title: "File: Open Folder", hint: "folder", run: openFolder },
   { title: "Go to File", hint: "Ctrl+P", run: () => openPalette("file") },
@@ -1819,6 +2129,12 @@ const COMMANDS = [
   { title: "Java: Go to Symbol", hint: "outline", run: () => goToDocumentSymbol() },
   { title: "Java: Go to Implementation", hint: "", run: () => jumpLike("java_implementation", "implementation") },
   { title: "Java: Go to Type Definition", hint: "", run: () => jumpLike("java_type_definition", "type definition") },
+  { title: "Java: Expand Selection", hint: "", run: () => expandSelection() },
+  { title: "Java: Incoming Calls", hint: "", run: () => showHierarchy("incoming", "incoming calls") },
+  { title: "Java: Outgoing Calls", hint: "", run: () => showHierarchy("outgoing", "outgoing calls") },
+  { title: "Java: Supertypes", hint: "", run: () => showHierarchy("supertypes", "supertypes") },
+  { title: "Java: Subtypes", hint: "", run: () => showHierarchy("subtypes", "subtypes") },
+  { title: "Java: Add Workspace Folder", hint: "", run: () => addWorkspaceFolder() },
   { title: "View: Split Editor", hint: "", run: () => toggleSplit() },
   { title: "Gradle: Compile", hint: "compileJava", run: () => runNamedTask("compileJava") },
   { title: "Gradle: Run Application", hint: "run", run: () => runNamedTask("run", (task) => task.isRun && task.name === "run") },
@@ -1935,8 +2251,11 @@ function renderLocations(container, locations, empty) {
     row.className = "reference-item";
     const line = location.range?.start?.line || 0;
     const character = location.range?.start?.character || 0;
-    row.textContent = `${workspaceRelative(location.path)}:${line + 1}:${character + 1}`;
-    row.addEventListener("click", () => openAbsoluteFile(location.path, line, character));
+    const label = location.uri && String(location.uri).startsWith("jdt:")
+      ? location.uri
+      : `${workspaceRelative(location.path)}:${line + 1}:${character + 1}`;
+    row.textContent = label;
+    row.addEventListener("click", () => openLocation(location));
     container.appendChild(row);
   }
 }
@@ -2053,7 +2372,7 @@ async function applyWorkspaceEdits(files) {
   if (!Array.isArray(files) || !files.length) return 0;
   let count = 0;
   for (const file of files) {
-    if (!file?.path || !file.path.startsWith(`${state.root}/`)) continue;
+    if (!file?.path || !pathAllowed(file.path)) continue;
     if (!state.docs.has(file.path)) {
       const content = await call("read_file", { path: file.path });
       state.docs.set(file.path, {
@@ -2366,6 +2685,18 @@ async function boot() {
     if (payload.name === "log" || payload.name === "status-message") {
       const message = payload.data?.message;
       if (message) appendJavaLog(String(message));
+      return;
+    }
+    if (payload.name === "workspace-edit") {
+      applyWorkspaceEdits(payload.data)
+        .then((count) => setStatus(count ? `Applied edits in ${count} place(s)` : "Server edit made no changes"))
+        .catch((error) => showError(String(error)));
+      return;
+    }
+    if (payload.name === "workspace-edit-rejected") {
+      const reason = payload.data?.reason || "workspace edit rejected";
+      appendJavaLog(reason);
+      setStatus(reason);
     }
   });
   renderJava();

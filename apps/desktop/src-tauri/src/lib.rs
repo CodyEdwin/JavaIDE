@@ -18,11 +18,14 @@ use ide_gradle::{
     RunTestsRequest, RunTestsResult, TestListing,
 };
 use ide_jdtls::{
-    CompletionCandidate, FileEdits, HoverInfo, JavaCodeAction, JavaSignature, JavaSymbol,
-    JdtlsClient, JdtlsConfig, JdtlsEvent, JdtlsInstallation, PINNED_JDTLS_VERSION, PrepareRename,
-    SourceLocation, SourcePosition, SourceRange, SourceTextEdit, ensure_jdtls,
+    CodeLensView, CompletionCandidate, FileEdits, FoldRange, HierarchyNode, HoverInfo,
+    InlayHintView, JavaCodeAction, JavaSignature, JavaSymbol, JdtlsClient, JdtlsConfig, JdtlsEvent,
+    JdtlsInstallation, PINNED_JDK_VERSION, PINNED_JDTLS_VERSION, PrepareRename, SemanticToken,
+    SourceLocation, SourcePosition, SourceRange, SourceTextEdit, ensure_jdk, ensure_jdtls,
 };
-use ide_opencode::{CreateSession, DiscoveredService, OpenCodeClient, PromptInput};
+use ide_opencode::{
+    CreateSession, DiscoveredService, OpenCodeClient, PermissionReply, PromptInput,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -809,6 +812,142 @@ async fn java_organize_imports(
         .map_err(|error| format!("Organize imports failed: {error}"))
 }
 
+/// Returns semantic tokens for an open Java file.
+#[tauri::command]
+async fn java_semantic_tokens(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Vec<SemanticToken>, String> {
+    let file = java_file(&state, &path).await?;
+    let client = java_client(&state).await?;
+    client
+        .semantic_tokens(&file, Duration::from_secs(20))
+        .await
+        .map_err(|error| format!("Semantic tokens failed: {error}"))
+}
+
+/// Returns inlay hints for the whole buffer.
+#[tauri::command]
+async fn java_inlay_hints(
+    state: State<'_, AppState>,
+    path: String,
+    end_line: u32,
+    end_character: u32,
+) -> Result<Vec<InlayHintView>, String> {
+    let file = java_file(&state, &path).await?;
+    let client = java_client(&state).await?;
+    client
+        .inlay_hints(
+            &file,
+            SourceRange {
+                start: SourcePosition::new(0, 0),
+                end: SourcePosition::new(end_line, end_character),
+            },
+            Duration::from_secs(20),
+        )
+        .await
+        .map_err(|error| format!("Inlay hints failed: {error}"))
+}
+
+/// Returns folding ranges for a Java file.
+#[tauri::command]
+async fn java_folding_ranges(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Vec<FoldRange>, String> {
+    let file = java_file(&state, &path).await?;
+    let client = java_client(&state).await?;
+    client
+        .folding_ranges(&file, Duration::from_secs(20))
+        .await
+        .map_err(|error| format!("Folding ranges failed: {error}"))
+}
+
+/// Returns selection ranges growing outward from the cursor.
+#[tauri::command]
+async fn java_selection_ranges(
+    state: State<'_, AppState>,
+    path: String,
+    line: u32,
+    character: u32,
+) -> Result<Vec<SourceRange>, String> {
+    let file = java_file(&state, &path).await?;
+    let client = java_client(&state).await?;
+    client
+        .selection_ranges(
+            &file,
+            SourcePosition::new(line, character),
+            Duration::from_secs(15),
+        )
+        .await
+        .map_err(|error| format!("Selection ranges failed: {error}"))
+}
+
+/// Returns one level of call or type hierarchy.
+#[tauri::command]
+async fn java_hierarchy(
+    state: State<'_, AppState>,
+    path: String,
+    line: u32,
+    character: u32,
+    direction: String,
+) -> Result<Vec<HierarchyNode>, String> {
+    let file = java_file(&state, &path).await?;
+    let client = java_client(&state).await?;
+    client
+        .hierarchy(
+            &file,
+            SourcePosition::new(line, character),
+            &direction,
+            Duration::from_secs(20),
+        )
+        .await
+        .map_err(|error| format!("Hierarchy failed: {error}"))
+}
+
+/// Returns resolved code lenses for a Java file.
+#[tauri::command]
+async fn java_code_lens(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Vec<CodeLensView>, String> {
+    let file = java_file(&state, &path).await?;
+    let client = java_client(&state).await?;
+    client
+        .code_lens(&file, Duration::from_secs(20))
+        .await
+        .map_err(|error| format!("Code lens failed: {error}"))
+}
+
+/// Reads decompiled source for a `jdt://` URI.
+#[tauri::command]
+async fn java_class_file(state: State<'_, AppState>, uri: String) -> Result<String, String> {
+    if !uri.starts_with("jdt:") || uri.len() > 8_192 || uri.contains('\0') {
+        return Err("only jdt: documents can be opened".to_owned());
+    }
+    let client = java_client(&state).await?;
+    client
+        .class_file_contents(&uri, Duration::from_secs(20))
+        .await
+        .map_err(|error| format!("Could not read the decompiled document: {error}"))
+}
+
+/// Imports another folder into the running language server.
+#[tauri::command]
+async fn java_add_folder(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let folder = PathBuf::from(&path)
+        .canonicalize()
+        .map_err(|error| format!("cannot add folder: {error}"))?;
+    if !folder.is_dir() {
+        return Err("choose a directory".to_owned());
+    }
+    let client = java_client(&state).await?;
+    client
+        .add_workspace_folder(&folder)
+        .await
+        .map_err(|error| format!("Could not add the folder: {error}"))
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TrustView {
@@ -1003,8 +1142,10 @@ fn discovery_status() -> JavaStatus {
             format!("jdtls at {} · JDK {}", root.display(), java.display()),
         ),
         (Some(_), None) => (
-            "unavailable",
-            "No JDK 21+ was found for jdtls. Set JAVAIDE_JDTLS_JAVA_HOME or JAVA_HOME.".to_owned(),
+            "stopped",
+            format!(
+                "No JDK 25 was found. Starting the language server downloads Temurin {PINNED_JDK_VERSION}, or set JAVAIDE_JDTLS_JAVA_HOME."
+            ),
         ),
         (None, _) => (
             "unavailable",
@@ -1076,17 +1217,9 @@ async fn start_java(app: &AppHandle, state: &AppState) -> JavaStatus {
             }
         }
     };
-    let Some(java_home) = find_jdtls_java_home() else {
-        return set_java_session(
-            app,
-            state,
-            None,
-            "unavailable",
-            "No JDK 21+ was found for jdtls. Set JAVAIDE_JDTLS_JAVA_HOME or JAVA_HOME.".to_owned(),
-            Some(installation_root),
-            None,
-        )
-        .await;
+    let java_home = match resolve_jdtls_java(app, state, &installation_root).await {
+        Ok(home) => home,
+        Err(status) => return status,
     };
     let installation = match JdtlsInstallation::discover(&installation_root) {
         Ok(installation) => installation,
@@ -1372,6 +1505,14 @@ fn java_event_payload(app: &AppHandle, event: &JdtlsEvent) -> Option<(String, Va
             "closed".to_owned(),
             serde_json::json!({ "reason": format!("process exited: {status:?}") }),
         )),
+        JdtlsEvent::WorkspaceEdit { files } => Some((
+            "workspace-edit".to_owned(),
+            serde_json::to_value(files).unwrap_or(Value::Null),
+        )),
+        JdtlsEvent::WorkspaceEditRejected { reason } => Some((
+            "workspace-edit-rejected".to_owned(),
+            serde_json::json!({ "reason": reason }),
+        )),
         JdtlsEvent::Diagnostics(_) | JdtlsEvent::Notification { .. } => None,
     }
 }
@@ -1415,7 +1556,46 @@ fn discover_jdtls_root() -> Option<PathBuf> {
 }
 
 fn find_jdtls_java_home() -> Option<PathBuf> {
-    find_jdk(21)
+    find_jdk(ide_jdtls::JDTLS_MIN_JAVA)
+}
+
+/// Uses an installed JDK 25, or downloads the pinned Temurin runtime.
+async fn resolve_jdtls_java(
+    app: &AppHandle,
+    state: &AppState,
+    installation_root: &Path,
+) -> Result<PathBuf, JavaStatus> {
+    if let Some(home) = find_jdtls_java_home() {
+        return Ok(home);
+    }
+    let destination = app_data_dir()
+        .join("runtimes")
+        .join(format!("jdk-{PINNED_JDK_VERSION}"));
+    set_java_session(
+        app,
+        state,
+        None,
+        "starting",
+        format!("jdtls needs JDK 25. Downloading Temurin {PINNED_JDK_VERSION} (about 135 MB)…"),
+        Some(installation_root.to_path_buf()),
+        None,
+    )
+    .await;
+    match ensure_jdk(&destination).await {
+        Ok(home) => Ok(home),
+        Err(error) => Err(set_java_session(
+            app,
+            state,
+            None,
+            "unavailable",
+            format!(
+                "jdtls needs JDK 25. None was found, and Temurin {PINNED_JDK_VERSION} could not be downloaded: {error}. Install a JDK 25 and set JAVAIDE_JDTLS_JAVA_HOME."
+            ),
+            Some(installation_root.to_path_buf()),
+            None,
+        )
+        .await),
+    }
 }
 
 fn version_directories(root: &Path) -> Vec<PathBuf> {
@@ -1477,16 +1657,40 @@ async fn opencode_connect(
         .await
         .map_err(|error| format!("OpenCode event subscription failed: {error}"))?;
     let handle = app.clone();
+    let stream_client = Arc::clone(&client);
     tauri::async_runtime::spawn(async move {
-        while let Some(event) = stream.recv().await {
-            let Ok(event) = event else { break };
+        loop {
+            while let Some(event) = stream.recv().await {
+                let Ok(event) = event else { break };
+                let _ = handle.emit(
+                    "opencode://event",
+                    AiEvent {
+                        name: event.name,
+                        data: event.data,
+                    },
+                );
+            }
             let _ = handle.emit(
                 "opencode://event",
                 AiEvent {
-                    name: event.name,
-                    data: event.data,
+                    name: "stream.closed".to_owned(),
+                    data: Value::Null,
                 },
             );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            match stream_client.subscribe_events().await {
+                Ok(next) => {
+                    stream = next;
+                    let _ = handle.emit(
+                        "opencode://event",
+                        AiEvent {
+                            name: "stream.reconnected".to_owned(),
+                            data: Value::Null,
+                        },
+                    );
+                }
+                Err(_) => break,
+            }
         }
     });
     *state.opencode.lock().await = Some(client);
@@ -1576,6 +1780,58 @@ async fn opencode_interrupt(
         .interrupt(&session_id)
         .await
         .map_err(|error| format!("cannot interrupt session: {error}"))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PermissionView {
+    id: String,
+    session_id: String,
+    action: String,
+    message: String,
+    resources: String,
+}
+
+#[tauri::command]
+async fn opencode_permissions(state: State<'_, AppState>) -> Result<Vec<PermissionView>, String> {
+    let client = state.opencode.lock().await.clone();
+    let client = client.ok_or_else(|| "OpenCode is not connected".to_owned())?;
+    let requests = client
+        .list_permission_requests()
+        .await
+        .map_err(|error| format!("cannot list permissions: {error}"))?;
+    Ok(requests
+        .into_iter()
+        .map(|request| PermissionView {
+            id: request.id,
+            session_id: request.session_id,
+            action: request.action,
+            message: request.message,
+            resources: request.resources.to_string(),
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn opencode_reply_permission(
+    state: State<'_, AppState>,
+    session_id: String,
+    request_id: String,
+    decision: String,
+) -> Result<(), String> {
+    ensure_trusted(&state)?;
+    let reply = match decision.as_str() {
+        "once" => PermissionReply::Once,
+        "always" => PermissionReply::Always,
+        "reject" => PermissionReply::Reject,
+        _ => return Err("decision must be once, always, or reject".to_owned()),
+    };
+    let client = state.opencode.lock().await.clone();
+    let client = client.ok_or_else(|| "OpenCode is not connected".to_owned())?;
+    client
+        .reply_permission(&session_id, &request_id, reply, None)
+        .await
+        .map_err(|error| format!("cannot reply to the permission request: {error}"))
 }
 
 fn summary(client: &OpenCodeClient) -> ServerSummary {
@@ -2013,6 +2269,14 @@ pub fn run() {
             java_workspace_symbols,
             java_format_document,
             java_organize_imports,
+            java_semantic_tokens,
+            java_inlay_hints,
+            java_folding_ranges,
+            java_selection_ranges,
+            java_hierarchy,
+            java_code_lens,
+            java_class_file,
+            java_add_folder,
             java_settings,
             save_java_settings,
             java_debug_log,
@@ -2025,6 +2289,8 @@ pub fn run() {
             opencode_context,
             opencode_prompt,
             opencode_interrupt,
+            opencode_permissions,
+            opencode_reply_permission,
         ])
         .run(tauri::generate_context!())
         .expect("error while running JavaIDE");

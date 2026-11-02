@@ -134,10 +134,13 @@ pub struct CompletionCandidate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceLocation {
-    /// Absolute filesystem path.
+    /// Absolute filesystem path. Empty when [`Self::uri`] is a virtual document.
     pub path: PathBuf,
     /// Range inside that file.
     pub range: SourceRange,
+    /// `jdt://` URI when the target is a decompiled class file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
 }
 
 /// A secondary location attached to a diagnostic.
@@ -379,11 +382,22 @@ pub(crate) fn definition_locations(response: GotoDefinitionResponse) -> Vec<Sour
 }
 
 pub(crate) fn location_view(location: Location) -> Option<SourceLocation> {
-    let path = uri_to_path(&location.uri).ok()?;
-    Some(SourceLocation {
-        path,
-        range: location.range.into(),
-    })
+    if let Ok(path) = uri_to_path(&location.uri) {
+        return Some(SourceLocation {
+            path,
+            range: location.range.into(),
+            uri: None,
+        });
+    }
+    let uri = location.uri.as_str();
+    if uri.starts_with("jdt:") {
+        return Some(SourceLocation {
+            path: PathBuf::new(),
+            range: location.range.into(),
+            uri: Some(uri.to_owned()),
+        });
+    }
+    None
 }
 
 /// Converts LSP text edits into buffer edits.
@@ -393,9 +407,8 @@ pub(crate) fn text_edits(edits: Vec<TextEdit>) -> Vec<SourceTextEdit> {
 
 /// Extracts the edits a workspace edit applies to `uri`.
 ///
-/// Only plain `changes` entries are read: the client advertises
-/// `documentChanges: false`, so jdtls must not send resource operations or
-/// grouped document edits here.
+/// Only the plain `changes` map is read. Versioned `documentChanges` go
+/// through [`crate::text::plan_workspace_edit`].
 pub(crate) fn workspace_text_edits(edit: &WorkspaceEdit, uri: &Uri) -> Vec<SourceTextEdit> {
     edit.changes
         .as_ref()
@@ -521,12 +534,18 @@ mod tests {
     }
 
     #[test]
-    fn definition_drops_virtual_documents() {
+    fn definition_keeps_decompiled_documents() {
         let response = GotoDefinitionResponse::Scalar(Location {
             uri: uri("jdt://contents/java.base/java/lang/String.class"),
             range: range((0, 0), (0, 0)),
         });
-        assert!(definition_locations(response).is_empty());
+        let locations = definition_locations(response);
+        assert_eq!(locations.len(), 1);
+        assert!(locations[0].path.as_os_str().is_empty());
+        assert_eq!(
+            locations[0].uri.as_deref(),
+            Some("jdt://contents/java.base/java/lang/String.class")
+        );
     }
 
     #[test]
