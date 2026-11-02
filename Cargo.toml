@@ -1,9 +1,11 @@
 [workspace]
 resolver = "3"
 members = [
+  "crates/ide-domain",
   "crates/ide-jsonrpc",
   "crates/ide-platform",
   "crates/ide-config",
+  "crates/ide-ui-api",
   "crates/ide-jdtls",
   "crates/ide-gradle",
   "crates/ide-opencode",
@@ -36,6 +38,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml = "0.8"
 url = "2"
+uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
+ts-rs = { version = "7", features = ["impl-export"] }
+schemars = "0.10"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

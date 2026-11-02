@@ -30,6 +30,7 @@ code or update the document in the same pull request.
 | --- | --- | --- | --- |
 | `ide-domain` | IDs, URIs/paths, text ranges, workspace/project/build/test/debug models, typed events/commands, port traits, error taxonomy | std, `serde`, `async-trait` | tokio, UI, LSP/DAP/OpenCode/Gradle SDKs |
 | `ide-jsonrpc` | JSON-RPC 2.0 envelope, framing, request correlation, cancellation, progress | serde, tokio-util | LSP, DAP, jdtls, Gradle |
+| `ide-ui-api` | Serializable UI commands/events/view models; TypeScript generation | `ide-domain` | UI toolkit, protocol crates |
 | `ide-lsp` | Generic LSP client, capabilities, document sync, feature request/response types, dynamic registration | `ide-jsonrpc`, `lsp-types` | Java, jdtls-specific settings, UI |
 | `ide-dap` | Generic Debug Adapter Protocol client | `ide-jsonrpc` | Java, DAP UI |
 | `ide-jdtls` | jdtls provisioning/launch, lifecycle, settings mapping, jdtls custom requests/notifications, Java project model | `ide-lsp`, `ide-platform`, `ide-config`, `ide-domain` | app, UI, Gradle bridge |

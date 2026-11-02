@@ -66,5 +66,6 @@ when the server does send them.
   buffers when the server becomes ready again.
 - The rest of the Java settings catalog in [JDTLS.md](JDTLS.md). The shell
   edits format, completion, and VM arguments.
-- `ide-ui-api` / `ts-rs` bindings.
+- `ide-domain` and `ide-ui-api` created with typed commands/events; `ts-rs`
+  bindings not yet generated.
 - Automatic JDK provisioning is Linux x86_64 only.
