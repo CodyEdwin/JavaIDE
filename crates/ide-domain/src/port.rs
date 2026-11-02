@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::{
-    AssistantSessionId, ByteOffset, DocumentId, LanguageError, PermissionRequestId,
-    ProjectId, TextRange, TurnId, WorkspaceId,
+    AssistantSessionId, DocumentId, LanguageError, PermissionRequestId, TextRange,
+    TurnId, WorkspaceId,
 };
 
 /// A cancellation token for long-running operations.
